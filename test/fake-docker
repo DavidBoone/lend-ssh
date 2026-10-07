@@ -1,0 +1,27 @@
+#!/bin/sh
+# A docker for the tests, with containers and volumes that are directories:
+# $FAKE_DOCKER/containers/NAME is the home directory in container NAME, and
+# $FAKE_DOCKER/volumes/NAME is volume NAME. It takes only the commands
+# lend-ssh runs, and logs each to $FAKE_DOCKER/log.
+root=$FAKE_DOCKER
+echo "docker $*" >>"$root/log"
+case $1 in
+  exec)
+    # exec -i CONTAINER sh -s
+    [ -d "$root/containers/$3" ] || { echo "Error response from daemon: No such container: $3" >&2; exit 1; }
+    HOME=$root/containers/$3 exec sh -s
+    ;;
+  run)
+    # run --rm -i --network none -v VOLUME:/lend-ssh-volume IMAGE sh -s
+    v=${7%%:*}
+    sed "s#/lend-ssh-volume#$root/volumes/$v#g" | sh -s
+    ;;
+  volume)
+    case $2 in
+      inspect) [ -d "$root/volumes/$3" ] || { echo "Error response from daemon: get $3: no such volume" >&2; exit 1; } ;;
+      ls) ls "$root/volumes" ;;
+    esac
+    ;;
+  ps) ls "$root/containers" ;;
+  *) echo "fake docker: no command $1" >&2; exit 1 ;;
+esac

@@ -1,0 +1,22 @@
+#compdef lend-ssh
+# lend-ssh's tab completion for zsh, which compinit loads from a directory on
+# $fpath. It hands the words to lend-ssh __complete, and completes file names
+# instead when that exits 1. A candidate with a description after a tab is
+# listed with it, in the order lend-ssh gives.
+local -a reply described plain
+local ret=0 line
+reply=(${(f)"$(lend-ssh __complete "${(@)words[2,CURRENT]}")"}) || ret=$?
+if (( ret == 1 )); then
+  _files
+  return
+fi
+for line in $reply; do
+  if [[ $line == *$'\t'* ]]; then
+    described+=("${${line%%$'\t'*}//:/\\:}:${line#*$'\t'}")
+  else
+    plain+=("$line")
+  fi
+done
+(( $#described )) && _describe -V -t lend-ssh 'lend-ssh' described
+(( $#plain )) && compadd -V lend-ssh -a plain
+return 0

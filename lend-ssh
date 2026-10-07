@@ -1,0 +1,2279 @@
+#!/usr/bin/env bash
+# lend-ssh: lend an agent short-lived SSH access with OpenSSH user certificates.
+# Kept compatible with bash 3.2 (macOS).
+set -euo pipefail
+
+prog=${0##*/}
+
+# The real script, found by following symlinks to it (macOS readlink has no
+# -f before 12.3).
+script=$0
+while [[ -L $script ]]; do
+  link=$(readlink "$script")
+  case $link in
+    /*) script=$link ;;
+    *) script=$(dirname "$script")/$link ;;
+  esac
+done
+script=$(cd "$(dirname "$script")" && pwd -P)/${script##*/}
+config=${XDG_CONFIG_HOME:-$HOME/.config}/lend-ssh
+ca=${LEND_SSH_CA:-$config/ca}
+agents=$config/agents
+agent_keys=$config/keys
+accounts=$config/accounts
+revoked=$config/revoked
+agent_re='^[A-Za-z0-9_][A-Za-z0-9_-]*$'
+name_re='^[A-Za-z0-9._-]+@[A-Za-z0-9._:-]+$'
+
+# The commands, as help lists them and completion offers them: a heading for
+# each group, then a line for each command: its name, its arguments (a form
+# per ;) and what it does. A noun's commands are "noun verb" lines, and the
+# noun alone lists.
+read -r -d '' command_table <<'EOF' || true
+Set up, once
+init||create the signing key
+account add|[-p] [-k FILE] [USER@]HOST...|let agents into these accounts
+agent add|[-f] NAME KEY|name an agent by its public key
+Day to day
+grant|;-t TIME [-O OPTION]... [-I ID] [-D] AGENT [USER@]HOST...|list the grants, or let AGENT into these accounts for a while
+revoke|AGENT [USER@]HOST...|take these accounts back from AGENT
+agent||list the agents, and what they can reach until when
+account||list the accounts, and which agents can reach them until when
+agent show|AGENT|show AGENT's certificate in detail
+Cut off
+account reset|[-k FILE] [USER@]HOST...|cancel every agent's grants to these accounts
+account rm|[-k FILE] [USER@]HOST...|shut all agents out of these accounts
+agent rm|NAME...|revoke agents' grants and forget them
+Other
+install|[-f] [DIR]|link lend-ssh onto your PATH, with tab completion
+uninstall|[DIR]|remove the links install made
+update||update lend-ssh (git pull in its clone)
+completion||print tab completion for bash and zsh
+help|[COMMAND]|show the commands, or COMMAND's help
+EOF
+
+# The options, as help lists them, the parser takes them and completion
+# offers them: the commands they belong to (separated by commas, none for
+# lend-ssh's own), their flags, their value if they take one, and what they
+# do. A line for each meaning.
+read -r -d '' option_table <<'EOF' || true
+|-h --help||show the commands, or with one, its help
+grant|-t --time|TIME|how long it lasts: 30m, 4h, 1h30m, 2d
+grant|-O --option|OPTION|also allow OPTION, such as permit-port-forwarding
+grant|-I --id|ID|the name hosts log it under (default AGENT)
+grant|-D --no-deadline||let sessions run on after the certificate expires
+account add|-p --print||print the lines to add by hand, instead of logging in
+account add,account reset,account rm|-k --file|FILE|the authorized_keys file, if not ~/.ssh/authorized_keys
+agent add|-f --force||replace an agent of that name
+install|-f --force||replace what's there
+EOF
+
+# Prints command $1's help beyond its usage line.
+command_prose() {
+  case $1 in
+    init)
+      cat <<EOF2
+Creates the signing key, $(tildify "$ca") (set LEND_SSH_CA for another
+path), asking for a passphrase. Load it into your ssh-agent with ssh-add to
+stop typing the passphrase for each grant.
+EOF2
+      ;;
+    'account add')
+      cat <<'EOF2'
+Logs in to each account over ssh, as you normally do, and adds a line to its
+~/.ssh/authorized_keys so that it accepts the certificates grant makes for it.
+An account is [USER@]HOST as ssh takes it; without USER@, it's your own user
+name there, or the User your ssh config sets.
+
+With -p, it prints the lines for you to add yourself, and from then on treats
+the accounts as set up.
+EOF2
+      ;;
+    'account reset')
+      cat <<'EOF2'
+Logs in to each account over ssh and changes its line, so that it stops
+accepting every certificate made for it so far, including any copies. Every
+agent's grants to the account end, and their open sessions end within about
+10 seconds, or with -k, when their certificates expire. The account stays set
+up for new grants.
+EOF2
+      ;;
+    'account rm')
+      cat <<'EOF2'
+Logs in to each account over ssh and removes its line, so that it accepts no
+agent's certificate. Open sessions end as with 'account reset'. 'account add'
+sets it up again, and grants made before stay cancelled.
+EOF2
+      ;;
+    account)
+      cat <<'EOF2'
+Lists the accounts set up from here, which agents can reach each, and until
+when. The account commands log in to the account over ssh; every other
+command only changes things on this machine.
+EOF2
+      ;;
+    'agent add')
+      cat <<'EOF2'
+NAME is letters, digits, '_' and '-', and can't start with '-'. KEY is the
+agent's public key file, such as /path/to/agent/.ssh/id_ed25519.pub (a
+private key's path means the .pub beside it), the public key itself, or a key
+file that this machine reaches with ssh or docker:
+
+  ssh://[USER@]HOST[:PORT]/PATH
+  docker://CONTAINER/PATH         in a running container, as its user
+  docker-volume://VOLUME/PATH     in a volume, from a container of alpine
+
+PATH starts at /, or with ~/ at the home directory there, as in
+docker://box/~/.ssh/id_ed25519.pub; in a volume, it starts at the volume's
+top. Set LEND_SSH_VOLUME_IMAGE for another image than alpine. KEY can be
+[USER@]HOST alone, for ssh://[USER@]HOST/~/.ssh/id_ed25519.pub, when HOST is
+in your ~/.ssh/config or known_hosts.
+
+When KEY is a path with no file there yet, agent add creates a key, without a
+passphrase, as the agent uses it unattended. It does so only in an existing
+directory, or a new one inside an existing directory, and not beside other
+keys. For a location, it creates the key on this machine, writes it there, and
+deletes it here.
+
+-f replaces agent NAME. While NAME has a valid certificate, it takes only the
+same key: at the same path here, or for an agent at a location or given as
+text, at any location, where it moves the certificate, or as text, when it
+prints the certificate.
+EOF2
+      ;;
+    'agent rm')
+      cat <<'EOF2'
+Revokes each agent's grants, removing its certificate, and forgets it. Its key
+stays. For an agent whose key is at an ssh:// or docker location, it removes
+a valid certificate there too, and forgets the agent even when it can't. Like
+revoke, it doesn't stop copies of the certificate, and grant and account list
+its accounts as revoked until the certificate expires.
+EOF2
+      ;;
+    'agent show')
+      cat <<'EOF2'
+Shows AGENT's certificate as ssh-keygen -L does, with lend-ssh's session
+deadline as one line in place of the script that holds it. AGENT may also be a
+key file.
+EOF2
+      ;;
+    agent)
+      cat <<'EOF2'
+Lists the agents, their keys, which accounts their certificates open, and
+until when. An agent with no valid certificate shows "no grant"; 'agent show'
+shows an expired one.
+EOF2
+      ;;
+    grant)
+      cat <<'EOF2'
+With nothing named, lists each agent's grant: its accounts and until when,
+and accounts revoked whose old certificate still works.
+
+Signs AGENT's key with a certificate for these accounts, and writes it beside
+the key as KEY-cert.pub, where ssh finds it, for as long as -t says. For an
+agent whose key is at an ssh:// or docker location, lend-ssh keeps a copy
+and writes it there; for one given as text, grant keeps a copy and prints it.
+Each account must be set up with 'account add'; in a terminal, grant offers to
+run it for those that aren't. When the certificate expires, the agent's
+sessions end and it can't log in again.
+
+Granting again while AGENT's certificate is valid adds to it: AGENT keeps the
+accounts it has, and the later of the two expiry times. To change -O or -D,
+revoke AGENT first.
+
+AGENT is an agent's name, or else a public key file, a public key, or - to
+read one from stdin. For a public key, grant prints the certificate instead
+of writing it, and logs it under the key's comment; it keeps no copy, so
+granting again replaces the certificate. -O takes permit-port-forwarding,
+permit-agent-forwarding, permit-X11-forwarding, permit-user-rc, or any
+ssh-keygen -O option.
+EOF2
+      ;;
+    revoke)
+      cat <<'EOF2'
+Takes these accounts out of AGENT's certificate, or with none named, removes
+the certificate. Sessions AGENT has open run on until the certificate would
+have expired.
+
+revoke changes only the certificate where grant wrote it, and for an agent
+given as text, prints the new one, if any. When it can't change it at an
+agent's location, it revokes nothing, so revoking again retries. A copy made
+before keeps working until it expires, so grant, agent and account list the
+accounts as revoked until then. 'account reset' stops every certificate for
+an account.
+EOF2
+      ;;
+    install)
+      cat <<'EOF2'
+Links lend-ssh into DIR, or the first of ~/.local/bin, ~/bin,
+/opt/homebrew/bin and /usr/local/bin that is on your PATH and that you can
+write to, and its tab completion where your shells load it.
+EOF2
+      ;;
+    uninstall)
+      cat <<'EOF2'
+Removes the links install made: on your PATH and in the directories install
+picks from, or in DIR, and its tab completion. Then it lists what stays, with
+how to remove each: run 'account rm' on each account before you delete your
+signing key, to take its line off the account.
+EOF2
+      ;;
+    update) echo "Updates lend-ssh: git pull in its clone, fast-forward only." ;;
+    completion) echo "To load from your shell's startup file: eval \"\$(lend-ssh completion)\"" ;;
+    help) echo "Shows the commands, or COMMAND's help, as 'lend-ssh COMMAND -h' does." ;;
+  esac
+}
+
+# Prints the lines of command_table for command $1, or for every command of
+# noun $1 when it's a noun, "account" or "agent".
+command_lines() {
+  local name args desc
+  while IFS='|' read -r name args desc; do
+    [[ -n $desc ]] || continue
+    [[ $name == "$1" || $name == "$1 "* ]] && echo "$name|$args|$desc"
+  done <<<"$command_table"
+  return 0
+}
+
+# True when $1 is a noun: a command with verbs.
+is_noun() {
+  [[ $1 != *' '* ]] && command_lines "$1" | cut -d'|' -f1 | grep -q "^$1 "
+}
+
+# Prints noun $1's verbs, separated by commas.
+verbs() {
+  command_lines "$1" | sed -n "s/^$1 \([^|]*\)|.*/\1/p" | paste -sd, - | sed 's/,/, /g'
+}
+
+# Prints the lines of option_table for command $1 ("" for lend-ssh's own
+# options): flags|value|description.
+page_options() {
+  local pages flags value desc
+  while IFS='|' read -r pages flags value desc; do
+    [[ ",$pages," == *",$1,"* ]] && echo "$flags|$value|$desc"
+  done <<<"$option_table"
+  return 0
+}
+
+# Prints command $1's options as help lists them.
+option_lines() {
+  local flags value desc f shown
+  while IFS='|' read -r flags value desc; do
+    [[ -n $flags ]] || continue
+    shown=''
+    for f in $flags; do shown+=", $f"; done
+    shown=${shown#, }
+    [[ $shown == --* ]] && shown="    $shown"
+    printf '  %-20s %s\n' "$shown${value:+ $value}" "$desc"
+  done <<<"$(page_options "$1")"
+}
+
+# Prints "FLAG|VALUE" for option $1 among page_options' lines $2: the first
+# flag of its line, and the name of its value if it takes one. Fails if
+# there's no such option.
+option_spec() {
+  local flags value desc f
+  while IFS='|' read -r flags value desc; do
+    for f in $flags; do
+      if [[ $f == "$1" ]]; then
+        echo "${flags%% *}|$value"
+        return 0
+      fi
+    done
+  done <<<"$2"
+  return 1
+}
+
+# Reads the words $2... as command $1's options take them: options, until --
+# or the first other word, then arguments. Sets opts to the options given,
+# each by its first flag followed by its value (empty for one that takes
+# none), and args to the arguments.
+parse_options() {
+  local table word flag spec value
+  table=$(page_options "$1")
+  shift
+  opts=() args=()
+  while (($#)); do
+    word=$1
+    case $word in
+      --)
+        shift
+        break
+        ;;
+      --*)
+        shift
+        flag=${word%%=*}
+        spec=$(option_spec "$flag" "$table") || usage_error "unknown option $flag"
+        if [[ -z ${spec#*|} ]]; then
+          [[ $word != *=* ]] || usage_error "$flag takes no value"
+          value=''
+        elif [[ $word == *=* ]]; then
+          value=${word#*=}
+        else
+          (($#)) || usage_error "$flag needs a value"
+          value=$1
+          shift
+        fi
+        opts+=("${spec%%|*}" "$value")
+        ;;
+      -?*)
+        shift
+        word=${word#-}
+        while [[ -n $word ]]; do
+          flag=-${word:0:1}
+          word=${word:1}
+          spec=$(option_spec "$flag" "$table") || usage_error "unknown option $flag"
+          if [[ -z ${spec#*|} ]]; then
+            value=''
+          elif [[ -n $word ]]; then
+            value=$word
+            word=''
+          else
+            (($#)) || usage_error "$flag needs a value"
+            value=$1
+            shift
+          fi
+          opts+=("${spec%%|*}" "$value")
+        done
+        ;;
+      *) break ;;
+    esac
+  done
+  args=("$@")
+}
+
+# Prints the value given to option $1 (by its first flag), the last one if
+# it was given more than once. Fails if it wasn't given.
+opt_value() {
+  local i
+  for ((i = ${#opts[@]} - 2; i >= 0; i -= 2)); do
+    if [[ ${opts[i]} == "$1" ]]; then
+      printf '%s\n' "${opts[i + 1]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Prints a command's synopses and description, as help lists them, from a
+# line of command_table.
+command_entry() {
+  local name args desc form
+  IFS='|' read -r name args desc <<<"$1"
+  if [[ -z $args ]]; then
+    printf '  %s\n' "$name"
+  else
+    while IFS= read -r form; do
+      printf '  %s\n' "$name${form:+ $form}"
+    done <<<"$(tr ';' '\n' <<<"$args")"
+  fi
+  printf '      %s\n' "$desc"
+}
+
+usage() {
+  local name args desc
+  echo "usage: $prog COMMAND [ARGS]"
+  echo
+  echo "Gives AI agents, or anything else you'd rather not hand your own SSH key,"
+  echo "SSH access to your accounts that ends on its own. An account is [USER@]HOST"
+  echo "as ssh takes it, your own user name there unless you give USER."
+  while IFS='|' read -r name args desc; do
+    if [[ -z $desc ]]; then
+      printf '\n%s:\n' "$name"
+    else
+      command_entry "$name|$args|$desc"
+    fi
+  done <<<"$command_table"
+  echo
+  echo "options:"
+  option_lines ''
+  echo
+  echo "'$prog COMMAND -h' shows more about COMMAND."
+}
+
+# Prints the help for command $1: "grant", "account add", or a noun, whose
+# help lists its verbs.
+command_help() {
+  local key=$1 line name args desc form lead='usage:'
+  line=$(command_lines "$key" | awk -F'|' -v k="$key" '$1 == k')
+  [[ -n $line ]] || usage_error "no command '$key'"
+  IFS='|' read -r name args desc <<<"$line"
+  if is_noun "$key"; then
+    echo "$lead $prog $key"
+    echo "   or: $prog $key COMMAND [ARGS]"
+  elif [[ -z $args ]]; then
+    echo "$lead $prog $key"
+  else
+    while IFS= read -r form; do
+      echo "$lead $prog $key${form:+ $form}"
+      lead='   or:'
+    done <<<"$(tr ';' '\n' <<<"$args")"
+  fi
+  echo
+  command_prose "$key"
+  if [[ -n $(page_options "$key") ]]; then
+    echo
+    echo "options:"
+    option_lines "$key"
+  fi
+  if is_noun "$key"; then
+    echo
+    echo "commands:"
+    command_lines "$key" | while IFS= read -r line; do
+      [[ $line != "$key "* ]] || command_entry "${line#"$key "}"
+    done
+    echo
+    echo "'$prog $key COMMAND -h' shows more about COMMAND."
+  fi
+  return 0
+}
+
+die() {
+  echo "$prog: $*" >&2
+  exit 1
+}
+
+# Dies with message $@ and where to read about the command, help_key, with
+# status 2.
+usage_error() {
+  if [[ -n ${help_key:-} ]]; then
+    echo "$prog: $* (see '$prog $help_key -h')" >&2
+  else
+    echo "$prog: $* (see '$prog help')" >&2
+  fi
+  exit 2
+}
+
+need_ca() {
+  [[ -f $ca.pub ]] || die "no signing key at $ca; create one with '$prog init'"
+}
+
+# Prints the CA's public key, base64 part.
+ca_blob() {
+  cut -d' ' -f2 "$ca.pub"
+}
+
+# Sets ca_args to ssh-keygen's arguments for signing with the CA: its copy in
+# your ssh-agent if it has one, else its private key file.
+ca_signer() {
+  if ssh-add -L 2>/dev/null | grep -qF " $(ca_blob)"; then
+    ca_args=(-s "$ca.pub" -U)
+  else
+    [[ -f $ca ]] || die "the signing key isn't at $ca or in your ssh-agent"
+    ca_args=(-s "$ca")
+  fi
+}
+
+# Sets dests to the accounts [USER@]HOST as given, and names to their
+# USER@HOST names: the user and host name ssh -G gives for each.
+resolve_accounts() {
+  local t name
+  [[ $# -gt 0 ]] || usage_error "name at least one [USER@]HOST"
+  dests=() names=()
+  for t in "$@"; do
+    [[ $t != -* ]] || usage_error "'$t' isn't [USER@]HOST"
+    name=$(account_name "$t") || die "ssh -G can't read the ssh config for '$t'"
+    [[ $name =~ $name_re ]] ||
+      die "'$t' is '$name', which can't be a name (letters, digits, '.', '_', '-' and ':')"
+    dests+=("$t")
+    names+=("$name")
+  done
+}
+
+# Prints the USER@HOST name of account [USER@]HOST $1: the user and host name
+# ssh -G gives for it.
+account_name() {
+  local config
+  config=$(ssh -G -- "$1" 2>/dev/null) || return 1
+  echo "$(sed -n 's/^user //p' <<<"$config")@$(sed -n 's/^hostname //p' <<<"$config")"
+}
+
+# Each account set up from here has a record, $accounts/NAME, holding its
+# number and, once removed, "removed": "2" or "2 removed". Its certificates'
+# principal is NAME, then NAME#N from number 2 on; a new number cancels the
+# certificates made for the old one.
+
+# Prints account NAME's number, 0 for none.
+account_number() {
+  local n=0
+  [[ ! -f $accounts/$1 ]] || read -r n _ <"$accounts/$1" || true
+  echo "${n:-0}"
+}
+
+# True when account NAME is set up from here and not removed.
+account_open() {
+  local n state=''
+  [[ -f $accounts/$1 ]] || return 1
+  read -r n state <"$accounts/$1" || true
+  [[ $state != removed ]]
+}
+
+# set_account NAME N [removed]
+set_account() {
+  mkdir -p "$accounts"
+  echo "$2${3:+ $3}" >"$accounts/$1"
+}
+
+# The principal for account NAME at number N.
+principal() {
+  if (($2 > 1)); then echo "$1#$2"; else echo "$1"; fi
+}
+
+# The principal for account NAME now, or nothing when it isn't open.
+current_principal() {
+  account_open "$1" && principal "$1" "$(account_number "$1")"
+}
+
+trust_line() {
+  printf 'cert-authority,principals="%s" %s\n' "$1" "$(cat "$ca.pub")"
+}
+
+cmd_init() {
+  [[ $# -eq 0 ]] || usage_error "init takes no arguments"
+  [[ ! -e $ca ]] || die "$ca already exists"
+  mkdir -p "${ca%/*}"
+  chmod 700 "${ca%/*}"
+  ssh-keygen -q -t ed25519 -C "lend-ssh CA ${USER:-$(id -un)}@$(hostname)" -f "$ca"
+  echo "Created $ca. Next, set up each account agents may use:"
+  echo "  $prog account add [USER@]HOST"
+}
+
+# A POSIX sh script that adds ($1 = add) or removes ($1 = remove) the CA's
+# line in authorized_keys file $2 (empty for ~/.ssh/authorized_keys), with
+# line $3 to add, and prints what it did. Its values are safe in single
+# quotes: names match name_re, and the CA key and file have no quote.
+edit_script() {
+  local mode=$1 file=$2 line=${3:-} blob
+  blob=$(ca_blob)
+  # shellcheck disable=SC2016  # $HOME expands on the host
+  if [[ -n $file ]]; then file="'$file'"; else file='"$HOME/.ssh/authorized_keys"'; fi
+  cat <<EOF2
+set -e
+umask 077
+f=$file
+blob='$blob'
+line='$line'
+tmp="\$f.lend-ssh.\$\$"
+trap 'rm -f "\$tmp"' EXIT
+EOF2
+  if [[ $mode == add ]]; then
+    cat <<'EOF2'
+mkdir -p "$(dirname "$f")"
+touch "$f"
+if grep -qxF "$line" "$f"; then echo "already there"; exit 0; fi
+if grep -qF "$blob" "$f"; then
+  done="replaced the line for $(grep -F "$blob" "$f" | sed -n 's/.*principals="\([^"#]*\).*/\1/p' | head -1)"
+else
+  done=added
+fi
+grep -vF "$blob" "$f" >"$tmp" || true
+if [ -s "$tmp" ] && [ -n "$(tail -c1 "$tmp")" ]; then echo >>"$tmp"; fi
+printf '%s\n' "$line" >>"$tmp"
+cat "$tmp" >"$f"
+echo "$done"
+EOF2
+  else
+    cat <<'EOF2'
+if [ ! -f "$f" ] || ! grep -qF "$blob" "$f"; then echo "not there"; exit 0; fi
+grep -vF "$blob" "$f" >"$tmp" || true
+cat "$tmp" >"$f"
+echo removed
+EOF2
+  fi
+}
+
+# Runs edit_script for account i of dests and names over ssh, with line
+# principal $3, and prints what it did; fails if ssh did.
+edit_account() {
+  local mode=$1 file=$2 i=$3 principal=${4:-}
+  edit_script "$mode" "$file" "$(trust_line "$principal")" | ssh -- "${dests[i]}" sh -s
+}
+
+# Sets file to -k's value, if given.
+file_opt() {
+  file=$(opt_value -k) || file=''
+  [[ $file != *"'"* ]] || usage_error "-k FILE can't contain a single quote"
+}
+
+cmd_account_add() {
+  local file print='' i n out failed=''
+  local -a dests names
+  file_opt
+  ! opt_value -p >/dev/null || print=1
+  resolve_accounts "$@"
+  need_ca
+  for ((i = 0; i < ${#names[@]}; i++)); do
+    n=$(account_number "${names[i]}")
+    ((n > 0)) || n=1
+    if [[ -n $print ]]; then
+      trust_line "$(principal "${names[i]}" "$n")"
+      set_account "${names[i]}" "$n"
+    elif out=$(edit_account add "$file" "$i" "$(principal "${names[i]}" "$n")"); then
+      set_account "${names[i]}" "$n"
+      echo "${names[i]}: $out"
+    else
+      echo "${names[i]}: failed" >&2
+      failed=1
+    fi
+  done
+  [[ -z $failed ]]
+}
+
+# Removing an account moves it to its next number, so that adding it again
+# revives none of the certificates made before; removing it again doesn't.
+cmd_account_rm() {
+  local file i n out failed=''
+  local -a dests names
+  file_opt
+  resolve_accounts "$@"
+  need_ca
+  for ((i = 0; i < ${#names[@]}; i++)); do
+    n=$(account_number "${names[i]}")
+    ((n > 0)) || n=1
+    if out=$(edit_account remove "$file" "$i"); then
+      if account_open "${names[i]}" || [[ ! -f $accounts/${names[i]} ]]; then
+        set_account "${names[i]}" $((n + 1)) removed
+      fi
+      echo "${names[i]}: $out$(cancelled_note "$(principal "${names[i]}" "$n")")"
+    else
+      echo "${names[i]}: failed" >&2
+      failed=1
+    fi
+  done
+  [[ -z $failed ]]
+}
+
+cmd_account() {
+  [[ $# -eq 0 ]] || usage_error "unknown account command '$1' ($(verbs account), or none to list)"
+  local f name n state found='' p who live
+  live=$(live_revoked)
+  for f in "$accounts"/*; do
+    [[ -f $f ]] || continue
+    found=1
+    name=${f##*/}
+    n=0 state=''
+    read -r n state <"$f" || true
+    if [[ $state == removed ]]; then
+      echo "$name (removed)"
+      continue
+    fi
+    p=$(principal "$name" "$n")
+    who=$(holders "$p" "$live")
+    if [[ -n $who ]]; then
+      echo "$name"
+      printf '%s\n' "$who" | sed 's/^/\t/'
+    else
+      printf '%s\n\t%s\n' "$name" "no agent"
+    fi
+  done
+  [[ -n $found ]] || echo "No accounts. '$prog account add [USER@]HOST' sets one up."
+}
+
+# Prints "AGENT until TIME" for each agent whose certificate gives principal
+# $1 now, and "AGENT (revoked) until TIME" for each of live_revoked lines $2
+# (found if not given) for it.
+holders() {
+  local f name key to c_end c_id c_deadline end p live
+  local -a c_principals c_exts c_crit
+  if [[ $# -gt 1 ]]; then live=$2; else live=$(live_revoked); fi
+  for f in "$agents"/*; do
+    [[ -f $f ]] || continue
+    name=${f##*/}
+    read_agent "${f##*/}"
+    [[ $key == /* ]] || continue
+    cert_info "${key%.pub}-cert.pub" || continue
+    cert_valid || continue
+    if [[ " ${c_principals[*]-} " == *" $1 "* ]]; then
+      echo "$name$(until_text "$c_end")"
+    fi
+  done
+  while read -r end p name _; do
+    [[ -z $end || $p != "$1" ]] || echo "$name (revoked)$(until_text "$end")"
+  done <<<"$live"
+}
+
+# Prints ", cancelling AGENT's grant (until TIME), …" for the agents holding
+# principal $1, or nothing.
+cancelled_note() {
+  local who
+  who=$(holders "$1")
+  [[ -z $who ]] || printf '; cancelled: %s' "$(printf '%s\n' "$who" | paste -sd, - | sed 's/,/, /g')"
+}
+
+# The public key file for KEY: KEY itself, or KEY.pub beside a private key.
+pubkey_of() {
+  if [[ $1 == *.pub && -f $1 ]]; then
+    echo "$1"
+  elif [[ -f $1.pub ]]; then
+    echo "$1.pub"
+  else
+    die "no public key at $1 or $1.pub"
+  fi
+}
+
+# True when $1 is a public key given as TYPE KEY [COMMENT] or the KEY alone.
+is_pubkey_text() {
+  [[ $1 =~ ^(ssh|ecdsa|sk)-[^\ ]+\ AAAA || $1 =~ ^AAAA[A-Za-z0-9+/]+=*$ ]]
+}
+
+# Prints public key $1, given as TYPE KEY [COMMENT] or the KEY alone, as an
+# OpenSSH public key line. KEY's first bytes are its type's length and name.
+pubkey_text() {
+  local type
+  if [[ $1 =~ ^(ssh|ecdsa|sk)-[^\ ]+\ AAAA ]]; then
+    echo "$1"
+  elif [[ $1 =~ ^AAAA[A-Za-z0-9+/]+=*$ ]]; then
+    type=$({ base64 -d <<<"${1:0:88}" 2>/dev/null || base64 -D <<<"${1:0:88}" 2>/dev/null; } |
+      head -c 64 | tail -c +5 | LC_ALL=C tr -c 'A-Za-z0-9@.-' '\n' | head -1) || true
+    [[ $type =~ ^(ssh|ecdsa|sk)- ]] || die "can't tell what kind of key '${1:0:20}...' is"
+    echo "$type $1"
+  else
+    die "'$1' is neither an agent, a key file nor a public key"
+  fi
+}
+
+# An agent's key can be at a location this machine reaches with ssh or docker:
+# ssh://[USER@]HOST[:PORT]/PATH, docker://CONTAINER/PATH (in a running
+# container, as its user) or docker-volume://VOLUME/PATH (in a Docker volume,
+# from a throwaway container of $volume_image). PATH is from /, or from the
+# home directory there when it starts with ~/; in a volume, from the volume's
+# top. For an agent at a location, and one whose key was given as text,
+# lend-ssh keeps its public key and certificate in $agent_keys/NAME; grant and
+# revoke write the certificate to the location too, or print it.
+volume_image=${LEND_SSH_VOLUME_IMAGE:-alpine}
+volume_mount=/lend-ssh-volume
+location_forms='ssh://[USER@]HOST[:PORT]/PATH, docker://CONTAINER/PATH or docker-volume://VOLUME/PATH'
+
+# True when $1 is a location.
+is_location() {
+  [[ $1 == ssh://* || $1 == docker://* || $1 == docker-volume://* ]]
+}
+
+# True when [USER@]HOST $1 is a host ssh knows: a Host in ~/.ssh/config, or
+# in one of the known_hosts files ssh -G gives for it, under the host name and
+# port ssh -G gives.
+known_host() {
+  local host=${1#*@} config name port f
+  local -a files
+  [[ $1 =~ ^([A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+  ! grep -qxF -- "$host" <<<"$(config_hosts)" || return 0
+  config=$(ssh -G -- "$1" 2>/dev/null) || return 1
+  name=$(sed -n 's/^hostname //p' <<<"$config")
+  port=$(sed -n 's/^port //p' <<<"$config")
+  [[ $port == 22 ]] || name="[$name]:$port"
+  read -ra files <<<"$(sed -n -e 's/^userknownhostsfile //p' -e 's/^globalknownhostsfile //p' <<<"$config" | tr '\n' ' ')"
+  for f in ${files[@]+"${files[@]}"}; do
+    f=${f/#\~/$HOME}
+    [[ -r $f && -n $(ssh-keygen -F "$name" -f "$f" 2>/dev/null) ]] && return 0
+  done
+  return 1
+}
+
+# Reads location $1 into loc_kind (ssh, docker or docker-volume), loc_where
+# ([USER@]HOST[:PORT], the container or the volume) and loc_path (PATH). Dies
+# if it isn't one.
+parse_location() {
+  local path_re='^(~/)?[A-Za-z0-9._@+/-]+$' where_re='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+  [[ $1 =~ ^(ssh|docker|docker-volume)://([^/]*)/(.*)$ ]] ||
+    die "'$1' isn't a location: $location_forms"
+  loc_kind=${BASH_REMATCH[1]} loc_where=${BASH_REMATCH[2]} loc_path=${BASH_REMATCH[3]}
+  [[ $loc_kind != ssh ]] || where_re='^([A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*(:[0-9]+)?$'
+  [[ $loc_where =~ $where_re ]] || case $loc_kind in
+    ssh) die "'$loc_where' in $1 isn't [USER@]HOST[:PORT]" ;;
+    docker) die "'$loc_where' in $1 can't be a container's name" ;;
+    *) die "'$loc_where' in $1 can't be a volume's name" ;;
+  esac
+  [[ $loc_path =~ $path_re && $loc_path != */ ]] ||
+    die "'$loc_path' in $1 can't be a key's path (letters, digits and ._@+-/, after ~/ for the home directory)"
+  [[ $loc_kind != docker-volume || $loc_path != \~/* ]] ||
+    die "a volume has no home directory; its paths start at its top, as in docker-volume://$loc_where/.ssh/id_ed25519.pub"
+}
+
+# Prints path $1, as loc_path is, for a sh script at the location
+# parse_location read.
+loc_sh() {
+  if [[ $loc_kind == docker-volume ]]; then
+    echo "'$volume_mount/$1'"
+  elif [[ $1 == \~/* ]]; then
+    echo "\"\$HOME\"/'${1#\~/}'"
+  else
+    echo "'/$1'"
+  fi
+}
+
+# Runs the sh script on stdin at the location parse_location read.
+at_location() {
+  local -a ssh_args=()
+  case $loc_kind in
+    ssh)
+      [[ $loc_where != *:* ]] || ssh_args=(-p "${loc_where##*:}")
+      ssh ${ssh_args[@]+"${ssh_args[@]}"} -- "${loc_where%:*}" sh -s
+      ;;
+    docker) docker exec -i "$loc_where" sh -s ;;
+    docker-volume)
+      # docker run would create a volume that isn't there.
+      docker volume inspect "$loc_where" >/dev/null || return
+      docker run --rm -i --network none -v "$loc_where:$volume_mount" "$volume_image" sh -s
+      ;;
+  esac
+}
+
+# Prints the lines of a sh script that sets variable $1 to the contents of
+# file $2.
+sh_contents() {
+  echo "$1=\$(cat <<'LEND_SSH_EOF'"
+  cat "$2"
+  printf 'LEND_SSH_EOF\n)\n'
+}
+
+# A sh script that prints the public key at path $1 (as loc_sh gives it), or
+# exits 73 if there's none but the private key $2 is there, else 74.
+probe_script() {
+  printf 'pub=%s\npriv=%s\n' "$1" "$2"
+  cat <<'EOF2'
+if [ -f "$pub" ]; then cat "$pub"; exit; fi
+if [ -e "$priv" ]; then exit 73; fi
+exit 74
+EOF2
+}
+
+# A sh script that writes files: for each pair of path (as loc_sh gives it)
+# and file in $@, the file's contents to the path. A file ending -cert.pub or
+# .pub is readable by all, and replaces what's there; another is readable only
+# by its owner, and is written beside no other public key: if there are
+# others, the script prints their names and exits 76. It writes into an
+# existing directory, or one it makes in an existing directory, else exits 75.
+# Its files and any directory it makes belong to the owner of the directory
+# they're in.
+put_script() {
+  local i=0
+  echo set -e
+  while (($#)); do
+    i=$((i + 1))
+    echo "f$i=$1"
+    sh_contents "c$i" "$2"
+    shift 2
+  done
+  echo "n=$i"
+  cat <<'EOF2'
+owner() { ls -nd "$1" | awk '{ print $3 ":" $4 }'; }
+put() {
+  d=$(dirname "$1")
+  if [ ! -d "$d" ]; then
+    [ -d "$(dirname "$d")" ] || exit 75
+    (umask 077 && mkdir "$d")
+    [ "$(id -u)" != 0 ] || chown "$(owner "$(dirname "$d")")" "$d"
+  fi
+  case $1 in
+    *.pub) umask 022 ;;
+    *)
+      o=''
+      for k in "$d"/*.pub; do [ ! -e "$k" ] || o="$o${k##*/} "; done
+      [ -z "$o" ] || { echo "$o"; exit 76; }
+      umask 077
+      ;;
+  esac
+  t="$1.lend-ssh.$$"
+  trap 'rm -f "$t"' EXIT
+  printf '%s\n' "$2" >"$t"
+  [ "$(id -u)" != 0 ] || chown "$(owner "$d")" "$t"
+  mv "$t" "$1"
+  trap - EXIT
+}
+i=1
+while [ "$i" -le "$n" ]; do
+  eval 'put "$f'"$i"'" "$c'"$i"'"'
+  i=$((i + 1))
+done
+EOF2
+}
+
+# Writes certificate file $2 to location $1, or with no $2, removes the
+# certificate there. Fails, after ssh's or docker's message, if it can't.
+send_cert() {
+  local loc_kind loc_where loc_path cert
+  parse_location "$1"
+  cert=$(loc_sh "${loc_path%.pub}-cert.pub")
+  if [[ -n ${2:-} ]]; then
+    put_script "$cert" "$2" | at_location
+  else
+    printf 'rm -f %s\n' "$cert" | at_location
+  fi
+}
+
+# Prints epoch $1 as ssh-keygen's YYYYMMDDHHMMSS, in local time.
+stamp() {
+  date -d "@$1" +%Y%m%d%H%M%S 2>/dev/null || date -r "$1" +%Y%m%d%H%M%S
+}
+
+# Prints YYYYMMDDHHMMSS $1 as YYYY-MM-DD HH:MM:SS.
+show_time() {
+  echo "${1:0:4}-${1:4:2}-${1:6:2} ${1:8:2}:${1:10:2}:${1:12:2}"
+}
+
+# The forced command that holds a certificate's sessions to deadline $1
+# (epoch) and to principals $2..., which the host's authorized_keys must still
+# trust.
+deadline_command() {
+  local deadline=$1
+  shift
+  echo "/bin/sh -c '$deadline_script' lend-ssh $deadline $(ca_blob) $*"
+}
+
+# Reads certificate file $1 into c_principals, c_end (YYYYMMDDHHMMSS, empty
+# for none), c_id, c_exts, c_crit (other critical options as ssh-keygen -O
+# takes them) and c_deadline (the epoch of lend-ssh's session deadline, if it
+# has one). Fails if there's no readable certificate.
+cert_info() {
+  local info tag value name
+  c_principals=() c_exts=() c_crit=() c_end='' c_id='' c_deadline=''
+  [[ -f $1 ]] && info=$(ssh-keygen -L -f "$1" 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    tag=${line%% *} value=${line#* }
+    case $tag in
+      I) c_id=$value ;;
+      V) [[ $value =~ (to|before)\ ([0-9T:-]+) ]] && c_end=$(tr -dc 0-9 <<<"${BASH_REMATCH[2]}") ;;
+      P) c_principals+=("$value") ;;
+      E) c_exts+=("$value") ;;
+      C)
+        value=${value//$'\001'/$'\n'}
+        name=${value%% *}
+        if [[ $value == "force-command /bin/sh -c 'd=\$1 "* && $value =~ \'\ lend-ssh\ ([0-9]+)\  ]]; then
+          c_deadline=${BASH_REMATCH[1]}
+        elif [[ $value == *' '* ]]; then
+          c_crit+=("$name=${value#* }")
+        else
+          c_crit+=("$name")
+        fi
+        ;;
+    esac
+  done < <(awk '
+    function flush() { if (c != "") { print "C " c; c = "" } }
+    /^        Key ID: / { sub(/^        Key ID: "/, ""); sub(/"$/, ""); print "I " $0; next }
+    /^        Valid: / { sub(/^        Valid: /, ""); print "V " $0; next }
+    /^        Principals:/ { s = "P"; next }
+    /^        Critical Options:/ { s = "C"; next }
+    /^        Extensions:/ { flush(); s = "E"; next }
+    /^        [A-Z]/ { flush(); s = ""; next }
+    s == "P" && /^                / { sub(/^ +/, ""); print "P " $0; next }
+    s == "E" && /^                / { sub(/^ +/, ""); sub(/ .*/, ""); print "E " $0; next }
+    s == "C" && /^                [a-z]/ { flush(); sub(/^ +/, ""); c = $0; next }
+    s == "C" { c = c "\001" $0; next }
+    END { flush() }' <<<"$info")
+}
+
+# True when the certificate cert_info read is valid now.
+cert_valid() {
+  [[ -z $c_end || $c_end > $(date +%Y%m%d%H%M%S) ]]
+}
+
+# Prints the options of a certificate as words to compare: its extensions and
+# other critical options, and "deadline" if it has lend-ssh's, sorted.
+option_words() {
+  { printf 'E:%s\n' ${c_exts[@]+"${c_exts[@]}"}
+    printf 'C:%s\n' ${c_crit[@]+"${c_crit[@]}"}
+    [[ -z $c_deadline ]] || echo deadline
+  } | grep -v '^[EC]:$' | LC_ALL=C sort | tr '\n' ' '
+}
+
+# Prints option words $1 for people: "permit-pty, session deadline".
+readable() {
+  local words
+  words=$(tr ' ' '\n' <<<"$1" | sed '/^$/d; s/^[EC]://; s/^deadline$/session deadline/' | paste -sd, - | sed 's/,/, /g')
+  echo "${words:-nothing}"
+}
+
+# Prints the option words a certificate made with ssh-keygen -O options $@
+# (after -O clear) has, as option_words does: what ssh-keygen does with each.
+expected_words() {
+  local o
+  local -a exts=() crit=()
+  for o in "$@"; do
+    case $o in
+      clear) exts=() crit=() ;;
+      permit-* | no-touch-required) exts+=("$o") ;;
+      no-*) exts=(${exts[@]+"${exts[@]/permit-${o#no-}/}"}) ;;
+      extension:*) exts+=("${o#extension:}") ;;
+      critical:*) crit+=("${o#critical:}") ;;
+      *) crit+=("$o") ;;
+    esac
+  done
+  local c_exts=(${exts[@]+"${exts[@]%%=*}"}) c_crit=(${crit[@]+"${crit[@]}"}) c_deadline=''
+  [[ -z $deadline ]] || c_deadline=1
+  option_words
+}
+
+# Prints "AGENT: ACCOUNTS until TIME" for each agent with a valid certificate,
+# or accounts revoked whose copies still work, and those of keys that are no
+# agent's now.
+list_grants() {
+  local f name key to live status keys='' end p k others='' last='' found=''
+  live=$(live_revoked)
+  for f in "$agents"/*; do
+    [[ -f $f ]] || continue
+    name=${f##*/}
+    read_agent "${f##*/}"
+    [[ $key == /* ]] || continue
+    keys+="$key"$'\n'
+    status=$(cert_status "${key%.pub}-cert.pub" "$live")
+    [[ $status != "no grant" ]] || continue
+    found=1
+    printf '%s\n' "$status" | sed "s/^/$name: /"
+  done
+  while read -r end p name k; do
+    [[ -z $end ]] || grep -qxF -- "$k" <<<"$keys" || others+="$name $end $p"$'\n'
+  done <<<"$live"
+  while read -r name end p; do
+    [[ -n $name && $name != "$last" ]] || continue
+    last=$name
+    revoked_groups "$(awk -v n="$name" '$1 == n { print $2, $3 }' <<<"$others")" | sed "s/^/$name: /"
+  done < <(sort <<<"$others")
+  [[ -n $found$others ]] || echo "No grants. '$prog grant -t TIME AGENT [USER@]HOST...' makes one."
+}
+
+# For grant: when accounts in dests aren't set up from here, offers in a
+# terminal to set them up as account add does, and dies otherwise.
+set_up_accounts() {
+  local i answer which
+  local -a missing=() opts=()
+  for ((i = 0; i < ${#names[@]}; i++)); do
+    account_open "${names[i]}" || missing+=("${dests[i]}")
+  done
+  [[ ${#missing[@]} -gt 0 ]] || return 0
+  which=${missing[*]}
+  if [[ -t 0 && -t 2 ]]; then
+    printf "%s isn't set up for agents from here; set it up now ('%s account add %s')? [y/N] " \
+      "$which" "$prog" "$which" >&2
+    read -r answer || answer=''
+    if [[ $answer == [yY]* ]]; then
+      cmd_account_add "${missing[@]}" || die "account add failed, so nothing was granted"
+      return
+    fi
+  fi
+  die "$which isn't set up for agents from here: '$prog account add $which' sets it up"
+}
+
+cmd_grant() {
+  local time='' id='' i o key to='' pub principals tmp='' deadline=1 secs name cert end epoch
+  local c_end c_id c_deadline now_end
+  local -a key_opts=(clear permit-pty) dests names new=() kept=() all=() c_principals c_exts c_crit
+  for ((i = 0; i < ${#opts[@]}; i += 2)); do
+    case ${opts[i]} in
+      -t) time=${opts[i + 1]} ;;
+      -O) key_opts+=("${opts[i + 1]}") ;;
+      -I) id=${opts[i + 1]} ;;
+      -D) deadline='' ;;
+    esac
+  done
+  if [[ $# -eq 0 ]]; then
+    [[ ${#opts[@]} -gt 0 ]] || { list_grants; return; }
+    usage_error "grant takes an AGENT and the [USER@]HOST accounts to let it into"
+  fi
+  [[ -n $time ]] || usage_error "grant needs -t TIME, how long it lasts: 30m, 4h, 1h30m, 2d"
+  local agent=$1
+  key=$(agent_key "$1")
+  ! is_agent "$1" || read_agent "$1"
+  [[ -n $id || $key == "$1" ]] || id=$1
+  shift
+  resolve_accounts "$@"
+  [[ $time =~ ^([0-9]+[smhdwSMHDW]?)+$ ]] || usage_error "bad time '$time': use 30m, 4h, 1h30m, 2d"
+  secs=$(seconds "$time")
+  if [[ -n $deadline && " ${key_opts[*]} " == *" force-command="* ]]; then
+    usage_error "-O force-command needs -D: the session deadline is the certificate's forced command"
+  fi
+  need_ca
+  set_up_accounts
+  for name in "${names[@]}"; do
+    new+=("$(current_principal "$name")")
+  done
+
+  if [[ $key == - || ( ! -e $key && ! -e $key.pub ) ]]; then
+    tmp=$(mktemp -d)
+    # shellcheck disable=SC2064  # expand $tmp now
+    trap "rm -rf '$tmp'" EXIT
+    pub=$tmp/key.pub
+    if [[ $key == - ]]; then
+      cat >"$pub"
+    else
+      pubkey_text "$key" >"$pub"
+    fi
+    cert=$tmp/key-cert.pub
+  else
+    pub=$(pubkey_of "$key")
+    cert=${pub%.pub}-cert.pub
+  fi
+  # A key given for no agent is logged under its comment.
+  [[ -n $id ]] || id=$(cut -d' ' -f3- "$pub" | head -1)
+  [[ -n $id ]] || id=agent
+
+  epoch=$(($(date +%s) + secs))
+  now_end=$(stamp "$epoch")
+  end=$now_end
+  # A grant only adds: while the key's certificate is valid, the new one
+  # keeps its accounts that are still open and its end, if later.
+  if [[ -z $tmp ]] && cert_info "$cert" && cert_valid; then
+    local had want
+    had=$(option_words)
+    want=$(expected_words "${key_opts[@]}")
+    [[ $had == "$want" ]] ||
+      die "$agent's certificate allows $(readable "$had"), and this grant $(readable "$want"); 'lend-ssh revoke $agent' first"
+    for principals in ${c_principals[@]+"${c_principals[@]}"}; do
+      [[ " ${new[*]} " == *" $principals "* ]] && continue
+      [[ $(current_principal "${principals%%#*}" 2>/dev/null) == "$principals" ]] && kept+=("$principals")
+    done
+    if [[ -z $c_end ]] || [[ $c_end > $now_end ]]; then
+      end=$c_end
+      epoch=${c_deadline:-$epoch}
+    fi
+  fi
+  all=("${new[@]}" ${kept[@]+"${kept[@]}"})
+
+  local -a ca_args args=()
+  ca_signer
+  for o in "${key_opts[@]}"; do args+=(-O "$o"); done
+  [[ -z $deadline ]] || args+=(-O "force-command=$(deadline_command "$epoch" "${all[@]}")")
+  # Starting 5 minutes back allows for a host whose clock runs slow.
+  ssh-keygen -q "${ca_args[@]}" -I "$id" -n "$(IFS=,; echo "${all[*]}")" \
+    -V "-5m:${end:-forever}" ${args[@]+"${args[@]}"} "$pub" >&2
+  # The certificate goes to stdout when it isn't sent where the agent is, and
+  # what grant did to stderr.
+  local out=1
+  if [[ -n $tmp || $to == - ]]; then
+    cat "$cert"
+    out=2
+  elif [[ -n $to ]]; then
+    send_cert "$to" "$cert" || die "couldn't write $agent's certificate to $to; grant again to retry"
+  fi
+  {
+    printf '%s: ' "$id"
+    printf '%s (new), ' "${new[@]%%#*}"
+    [[ ${#kept[@]} -eq 0 ]] || printf '%s (kept), ' "${kept[@]%%#*}"
+    if [[ -n $end ]]; then echo "until $(show_time "$end")"; else echo "no expiry"; fi
+  } | sed 's/, until/ until/' >&"$out"
+}
+
+cmd_revoke() {
+  [[ $# -gt 0 ]] || usage_error "revoke takes an AGENT, and the accounts to take back"
+  local key to='' cert c_end c_id c_deadline name p left='' end out=1 sent=1
+  local -a dests names c_principals c_exts c_crit keep=() gone=() bases=()
+  key=$(agent_key "$1")
+  ! is_agent "$1" || read_agent "$1"
+  [[ $key == /* || -e $key || -e $key.pub ]] ||
+    die "$1's certificate isn't kept here, so it can't be narrowed; '$prog account reset [USER@]HOST' cancels it"
+  cert=$(pubkey_of "$key")
+  cert=${cert%.pub}-cert.pub
+  if ! cert_info "$cert" || ! cert_valid; then
+    echo "$1: no grant to revoke"
+    return
+  fi
+  name=$c_id
+  [[ $key == "$1" ]] || name=$1
+  shift
+  if [[ $# -gt 0 ]]; then
+    resolve_accounts "$@"
+    bases=("${names[@]}")
+  fi
+  for p in "${c_principals[@]}"; do
+    if [[ $# -eq 0 || " ${bases[*]} " == *" ${p%%#*} "* ]]; then gone+=("$p"); else keep+=("$p"); fi
+  done
+  [[ ${#gone[@]} -gt 0 ]] || die "$c_id has no grant for ${bases[*]}"
+  end=$(until_text "$c_end")
+  local reset
+  reset="'$prog account reset $(printf '%s\n' "${gone[@]%%#*}" | paste -sd' ' -)'"
+  if [[ -n $c_deadline ]]; then
+    left="; a copy of the certificate, and sessions open there now, work$end, or until $reset"
+  else
+    left="; a copy of the certificate works there$end, or until $reset; sessions open there now run until they close"
+  fi
+  # For an agent at a location, the copy changes back if the location can't
+  # be changed, so that revoking again retries.
+  ! is_location "$to" || cp -p "$cert" "$cert.old"
+  if [[ ${#keep[@]} -eq 0 ]]; then
+    rm "$cert"
+  else
+    local -a ca_args args=(-O clear)
+    ca_signer
+    for p in ${c_exts[@]+"${c_exts[@]}"}; do args+=(-O "$p"); done
+    for p in ${c_crit[@]+"${c_crit[@]}"}; do args+=(-O "$p"); done
+    [[ -z $c_deadline ]] || args+=(-O "force-command=$(deadline_command "$c_deadline" "${keep[@]}")")
+    ssh-keygen -q "${ca_args[@]}" -I "$c_id" -n "$(IFS=,; echo "${keep[*]}")" \
+      -V "-5m:${c_end:-forever}" "${args[@]}" "$(pubkey_of "$key")"
+  fi
+  # As grant does, revoke prints a new certificate it doesn't send.
+  if [[ $to == - ]]; then
+    [[ ${#keep[@]} -eq 0 ]] || cat "$cert"
+    out=2
+  elif [[ -n $to ]]; then
+    if [[ ${#keep[@]} -eq 0 ]]; then send_cert "$to" || sent=''; else send_cert "$to" "$cert" || sent=''; fi
+    if [[ -z $sent ]]; then
+      mv "$cert.old" "$cert"
+      die "couldn't change the certificate at $to, so $c_id keeps its grant; revoke again to retry, or $reset stops it"
+    fi
+    rm "$cert.old"
+  fi
+  record_revoked "$c_end" "$name" "$(abs_path "$(pubkey_of "$key")")" "${gone[@]}"
+  {
+    printf '%s: revoked %s' "$c_id" "$(printf '%s\n' "${gone[@]%%#*}" | paste -sd, - | sed 's/,/, /g')"
+    [[ ${#keep[@]} -eq 0 ]] || printf '; keeps %s%s' "$(printf '%s\n' "${keep[@]%%#*}" | paste -sd, - | sed 's/,/, /g')" "$end"
+    echo "$left"
+  } >&"$out"
+}
+
+# Moves each account to its next number, which cancels every certificate
+# made for it; a session's watcher ends those open now.
+cmd_account_reset() {
+  local file i n out failed=''
+  local -a dests names
+  file_opt
+  resolve_accounts "$@"
+  need_ca
+  for ((i = 0; i < ${#names[@]}; i++)); do
+    if ! account_open "${names[i]}"; then
+      echo "${names[i]}: isn't set up for agents from here; nothing to reset"
+      continue
+    fi
+    n=$(account_number "${names[i]}")
+    if out=$(edit_account add "$file" "$i" "$(principal "${names[i]}" $((n + 1)))"); then
+      local note
+      note=$(cancelled_note "$(principal "${names[i]}" "$n")")
+      set_account "${names[i]}" $((n + 1))
+      echo "${names[i]}: every grant cancelled${note:-; there were none}"
+    else
+      echo "${names[i]}: failed" >&2
+      failed=1
+    fi
+  done
+  [[ -z $failed ]]
+}
+
+# Prints path $1 with a leading $HOME shown as ~.
+tildify() {
+  case $1 in
+    "$HOME" | "$HOME"/*) printf '%s\n' "~${1#"$HOME"}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# Links this script into DIR, or the first of these on PATH that you can
+# write to, else ~/.local/bin.
+cmd_install() {
+  local force='' dir d link rc
+  ! opt_value -f >/dev/null || force=1
+  [[ $# -le 1 ]] || usage_error "install takes at most one directory"
+  dir=${1:-}
+  if [[ -z $dir ]]; then
+    for d in "$HOME/.local/bin" "$HOME/bin" /opt/homebrew/bin /usr/local/bin; do
+      case ":$PATH:" in
+        *":$d:"*) if [[ -d $d && -w $d ]]; then dir=$d; break; fi ;;
+      esac
+    done
+    [[ -n $dir ]] || dir=$HOME/.local/bin
+  fi
+  link=$dir/lend-ssh
+  if [[ -L $link && $(readlink "$link") == "$script" ]]; then
+    echo "lend-ssh is already installed as $(tildify "$link")"
+  elif [[ -e $link || -L $link ]] && [[ -z $force ]]; then
+    die "$(tildify "$link") already exists; '$prog install -f' replaces it"
+  else
+    mkdir -p "$dir" && ln -sfn "$script" "$link"
+    echo "installed $(tildify "$link") -> $(tildify "$script")"
+  fi
+  case ${SHELL:-} in
+    */zsh) rc=$(tildify "$HOME/.zshrc") ;;
+    */bash) if [[ $OSTYPE == darwin* ]]; then rc=$(tildify "$HOME/.bash_profile"); else rc=$(tildify "$HOME/.bashrc"); fi ;;
+    *) rc='your shell startup file' ;;
+  esac
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *)
+      echo
+      echo "$(tildify "$dir") isn't on your PATH. Add this line to $rc, then open a new terminal:"
+      echo "  export PATH=\"${dir/#$HOME/\$HOME}:\$PATH\""
+      ;;
+  esac
+  install_completion
+}
+
+# Prints what `SHELL -lic SCRIPT` ($1, $2) prints after its startup files
+# have run, without what they print themselves.
+shell_says() {
+  "$1" -lic "echo lend-ssh-start; $2" </dev/null 2>/dev/null | awk 'go; /^lend-ssh-start$/ { go = 1 }' || true
+}
+
+# Links completion file $1 as $2, for shell $3; -f ($force) replaces another
+# file there. Fails, saying so, if there's another file and no -f.
+link_completion() {
+  if [[ -L $2 && $(readlink "$2") == "$1" ]]; then
+    echo "$3 tab completion is already installed as $(tildify "$2")"
+  elif [[ -e $2 || -L $2 ]] && [[ -z $force ]]; then
+    echo "$prog: $(tildify "$2") already exists; '$prog install -f' replaces it" >&2
+    return 1
+  else
+    mkdir -p "${2%/*}" && ln -sfn "$1" "$2"
+    echo "installed $3 tab completion as $(tildify "$2")"
+  fi
+}
+
+# Links the completion files where the shells load them by themselves: zsh's
+# into the first directory on its $fpath that you can write to, if zsh runs
+# compinit, and bash's into bash-completion's directory for your own, if bash
+# loads bash-completion 2. Otherwise prints the line that loads them, for your
+# login shell ($SHELL, startup file $rc). Fails if it refused to replace a
+# file, after doing the rest.
+install_completion() {
+  local comp=${script%/*}/completions d tip='' failed=''
+  if command -v zsh >/dev/null; then
+    # shellcheck disable=SC2016  # expanded by zsh
+    d=$(shell_says zsh '(( $+functions[compdef] )) && print -rl -- $fpath' | while IFS= read -r d; do
+      if [[ -d $d && -w $d ]]; then echo "$d"; break; fi
+    done)
+    if [[ -n $d ]]; then
+      link_completion "$comp/_lend-ssh" "$d/_lend-ssh" zsh || failed=1
+    elif [[ ${SHELL:-} == */zsh ]]; then
+      tip=1
+    fi
+  fi
+  if command -v bash >/dev/null && [[ -n $(shell_says bash 'declare -F _comp_load __load_completion') ]]; then
+    d=${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}
+    link_completion "$comp/lend-ssh.bash" "${d%%:*}/completions/lend-ssh" bash || failed=1
+  elif [[ ${SHELL:-} == */bash ]]; then
+    tip=1
+  fi
+  if [[ -n $tip ]]; then
+    echo
+    echo "For tab completion, add this line to $rc:"
+    # shellcheck disable=SC2016  # printed for the startup file, unexpanded
+    echo '  eval "$(lend-ssh completion)"'
+  fi
+  [[ -z $failed ]]
+}
+
+# Removes the links to this script and its completion files that install
+# makes: in DIR, the directories on PATH and the ones install picks from, on
+# zsh's $fpath and in bash-completion's directory for your own. It leaves
+# anything else of those names, and what's in $config.
+cmd_uninstall() {
+  [[ $# -le 1 ]] || usage_error "uninstall takes at most one directory"
+  local comp=${script%/*}/completions d link found=''
+  local -a dirs=()
+  IFS=: read -ra dirs <<<"$PATH"
+  dirs+=("$HOME/.local/bin" "$HOME/bin" /opt/homebrew/bin /usr/local/bin ${1+"$1"})
+  while read -r link d; do
+    if [[ -L $link && $(readlink "$link") == "$d" ]]; then
+      rm "$link"
+      echo "removed $(tildify "$link")"
+      found=1
+    fi
+  done < <(
+    for d in ${dirs[@]+"${dirs[@]}"}; do
+      [[ -n $d ]] && echo "$d/lend-ssh $script"
+    done
+    if command -v zsh >/dev/null; then
+      # shellcheck disable=SC2016  # expanded by zsh
+      shell_says zsh 'print -rl -- $fpath' | while IFS= read -r d; do
+        echo "$d/_lend-ssh $comp/_lend-ssh"
+      done
+    fi
+    d=${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}
+    echo "${d%%:*}/completions/lend-ssh $comp/lend-ssh.bash"
+  )
+  [[ -n $found ]] || echo "found no links to $(tildify "$script") to remove"
+  uninstall_leaves
+}
+
+# Prints what uninstall leaves, and how to remove each.
+uninstall_leaves() {
+  local run f n state key to
+  run=$(tildify "$script")
+  echo
+  echo "These stay:"
+  for f in "$accounts"/*; do
+    [[ -f $f ]] || continue
+    read -r n state <"$f" || true
+    if [[ $state != removed ]]; then
+      echo "- each account's line for agents: '$run account rm [USER@]HOST' removes it"
+      break
+    fi
+  done
+  for f in "$agents"/*; do
+    [[ -f $f ]] || continue
+    read_agent "${f##*/}"
+    if [[ $key == /* && $to != - && -f ${key%.pub}-cert.pub ]]; then
+      echo "- agents' certificates, beside their keys: '$run agent rm NAME...' removes them"
+      break
+    fi
+  done
+  case $ca in
+    "$config"/*)
+      [[ ! -d $config ]] ||
+        echo "- your signing key, agents and accounts, in $(tildify "$config"): rm -r $(tildify "$config")"
+      ;;
+    *)
+      [[ ! -d $config ]] || echo "- your agents and accounts, in $(tildify "$config"): rm -r $(tildify "$config")"
+      [[ ! -e $ca ]] || echo "- the signing key, $(tildify "$ca"): rm $(tildify "$ca") $(tildify "$ca").pub"
+      ;;
+  esac
+  echo "- this clone, $(tildify "${script%/*}"): rm -rf $(tildify "${script%/*}")"
+  # shellcheck disable=SC2016  # the line as you'd have added it
+  echo '- any eval "$(lend-ssh completion)" line you added to your shell'\''s startup file'
+}
+
+# Prints the clone's version: its tag, or else its commit.
+version() {
+  git -C "${script%/*}" describe --tags --always --dirty 2>/dev/null || echo unknown
+}
+
+# Fast-forwards the clone, and lists what that brought in.
+cmd_update() {
+  [[ $# -eq 0 ]] || usage_error "update takes no arguments"
+  local clone=${script%/*} before after count
+  git -C "$clone" rev-parse --git-dir >/dev/null 2>&1 ||
+    die "$(tildify "$clone") isn't a git checkout, so there's nothing to update"
+  before=$(git -C "$clone" rev-parse HEAD)
+  git -C "$clone" pull --ff-only --quiet ||
+    die "git pull failed in $(tildify "$clone") (git's message is above); sort it out with git there"
+  after=$(git -C "$clone" rev-parse HEAD)
+  if [[ $before == "$after" ]]; then
+    echo "lend-ssh $(version) is up to date"
+    return 0
+  fi
+  # One line per change: --first-parent shows a merged pull request as its
+  # merge commit rather than every commit inside it.
+  count=$(git -C "$clone" rev-list --first-parent --count "$before..$after")
+  echo "lend-ssh updated to $(version), $count change$([[ $count == 1 ]] || echo s):"
+  git -C "$clone" log --first-parent --no-decorate --format='  %h %s' -n 20 "$before..$after"
+  if ((count > 20)); then
+    echo "  ... and $((count - 20)) more: git -C $(tildify "$clone") log"
+  fi
+}
+
+# Prints the tab completion files' code, for bash and zsh, to eval in a
+# shell startup file.
+cmd_completion() {
+  local comp=${script%/*}/completions
+  [[ $# -eq 0 ]] || usage_error "completion takes no arguments"
+  # shellcheck disable=SC2016  # printed for the shell, unexpanded
+  echo '# lend-ssh'\''s tab completion, for bash and zsh: eval "$(lend-ssh completion)"'
+  cat <<'EOF2'
+if [ -n "${ZSH_VERSION-}" ]; then
+  (( $+functions[compdef] )) || { autoload -Uz compinit && compinit; }
+  _lend-ssh() {
+EOF2
+  grep -v '^#' "$comp/_lend-ssh" | sed 's/^/    /'
+  cat <<'EOF2'
+  }
+  compdef _lend-ssh lend-ssh
+else
+EOF2
+  grep -v '^#' "$comp/lend-ssh.bash" | sed 's/^/  /'
+  echo 'fi'
+}
+
+# Prints the words in $@ that start with the word being completed, $cur, and
+# aren't in $given, less $strip (what bash, which splits words at @, = and :,
+# has before its own current word). A word may have a description after a
+# tab, which zsh shows beside it.
+offer() {
+  local entry word
+  for entry in "$@"; do
+    word=${entry%%$'\t'*}
+    [[ $word == "$cur"* && " $given " != *" $word "* ]] && printf '%s\n' "${entry#"$strip"}"
+  done
+  return 0
+}
+
+# Offers command_table's commands under $1 ("" for the top level, or a
+# noun), one word each with its description.
+offer_commands() {
+  local name args desc word
+  local -a words=()
+  while IFS='|' read -r name args desc; do
+    [[ -n $desc ]] || continue
+    if [[ -z $1 ]]; then
+      word=${name%% *}
+      ! is_noun "$word" || desc="${word}s: $(verbs "$word"), or none to list"
+    else
+      [[ $name == "$1 "* ]] || continue
+      word=${name#"$1 "}
+    fi
+    [[ " ${words[*]-} " == *" $word"$'\t'* ]] || words+=("$word"$'\t'"$desc")
+  done <<<"$command_table"
+  offer ${words[@]+"${words[@]}"}
+}
+
+# Offers command $1's options, each flag with its description.
+offer_options() {
+  local flags value desc f
+  local -a words=()
+  while IFS='|' read -r flags value desc; do
+    [[ -n $flags ]] || continue
+    for f in $flags; do words+=("$f"$'\t'"$desc"); done
+  done <<<"$(page_options "$1")"
+  offer ${words[@]+"${words[@]}"}
+}
+
+# Offers the values of option $1 (by its first flag), each after $2.
+offer_values() {
+  case $1 in
+    -O)
+      offer "$2"permit-port-forwarding$'\t''port forwarding: ssh -L, -R, -D and -W' \
+        "$2"permit-agent-forwarding$'\t''ssh-agent forwarding: ssh -A' \
+        "$2"permit-X11-forwarding$'\t''X11 forwarding: ssh -X' \
+        "$2"permit-user-rc$'\t''running ~/.ssh/rc at login'
+      ;;
+  esac
+}
+
+# Prints the host names in ~/.ssh/config's Host lines, less patterns.
+config_hosts() {
+  local key line h
+  local -a names
+  [[ -r $HOME/.ssh/config ]] || return 0
+  while read -r key line; do
+    [[ $key == [Hh][Oo][Ss][Tt] ]] || continue
+    read -ra names <<<"$line"
+    for h in ${names[@]+"${names[@]}"}; do
+      [[ $h == *[*?!]* ]] || printf '%s\n' "$h"
+    done
+  done <"$HOME/.ssh/config"
+}
+
+# Prints the host names in ~/.ssh/config's Host lines, less patterns, and in
+# ~/.ssh/known_hosts, less hashed names and names with a port.
+ssh_hosts() {
+  local key line h
+  local -a names
+  {
+    config_hosts
+    if [[ -r $HOME/.ssh/known_hosts ]]; then
+      while read -r key line; do
+        [[ $key == [@#\|]* ]] && continue
+        IFS=, read -ra names <<<"$key"
+        for h in ${names[@]+"${names[@]}"}; do
+          [[ $h == [\[\|]* ]] || printf '%s\n' "$h"
+        done
+      done <"$HOME/.ssh/known_hosts"
+    fi
+  } | sort -u
+}
+
+# Offers [USER@]HOST, the host from ssh_hosts.
+offer_accounts() {
+  local h
+  local -a targets=()
+  while IFS= read -r h; do
+    if [[ $cur == *@* ]]; then targets+=("${cur%%@*}@$h"); else targets+=("$h"); fi
+  done < <(ssh_hosts)
+  offer ${targets[@]+"${targets[@]}"}
+}
+
+# Prints the names of the accounts set up from here.
+open_accounts() {
+  local f
+  for f in "$accounts"/*; do
+    [[ -f $f ]] && account_open "${f##*/}" && printf '%s\n' "${f##*/}"
+  done
+  return 0
+}
+
+# Prints the names of the accounts that the valid certificate of agent or key
+# $1 is for.
+granted_accounts() {
+  local key pub p c_end c_id c_deadline
+  local -a c_principals c_exts c_crit
+  key=$(agent_key "$1" 2>/dev/null) && pub=$(pubkey_of "$key" 2>/dev/null) || return 0
+  cert_info "${pub%.pub}-cert.pub" && cert_valid || return 0
+  for p in ${c_principals[@]+"${c_principals[@]}"}; do printf '%s\n' "${p%%#*}"; done
+}
+
+# Offers [USER@]HOST for the accounts named in lines $1: each ~/.ssh/config
+# alias that ssh -G resolves to one of them, with $cur's USER@ if it has one;
+# then, for each account no alias reaches, its HOST alone when that resolves
+# to it, else its name. Only words $cur begins are resolved.
+offer_named_accounts() {
+  local h name user='' reached=' '
+  local -a targets=()
+  [[ -n $1 ]] || return 0
+  [[ $cur != *@* ]] || user=${cur%%@*}@
+  while IFS= read -r h; do
+    [[ $user$h == "$cur"* ]] || continue
+    if name=$(account_name "$user$h") && [[ $'\n'$1$'\n' == *$'\n'$name$'\n'* ]]; then
+      targets+=("$user$h")
+      reached+="$name "
+    fi
+  done < <(config_hosts)
+  while IFS= read -r name; do
+    [[ $reached != *" $name "* ]] || continue
+    h=${name#*@}
+    if [[ -z $user && $h == "$cur"* && $(account_name "$h") == "$name" ]]; then
+      targets+=("$h")
+    else
+      targets+=("$name")
+    fi
+  done <<<"$1"
+  offer ${targets[@]+"${targets[@]}"}
+}
+
+# Prints the first flag of the option in option word $1 that takes its value
+# from the next word (--time, -t, or the -k of -pk), if any, among
+# page_options' lines $2.
+wanted_value() {
+  local word=$1 spec
+  if [[ $word == --* ]]; then
+    [[ $word != *=* ]] && spec=$(option_spec "$word" "$2") && [[ -n ${spec#*|} ]] && echo "${spec%%|*}"
+    return 0
+  fi
+  word=${word#-}
+  while [[ -n $word ]]; do
+    spec=$(option_spec "-${word:0:1}" "$2") || return 0
+    word=${word:1}
+    if [[ -n ${spec#*|} ]]; then
+      [[ -n $word ]] || echo "${spec%%|*}"
+      return 0
+    fi
+  done
+}
+
+# Prints option word $1's flags, both forms if it's one of the options among
+# page_options' lines $2, else the word itself.
+option_flags() {
+  local flags value desc f
+  while IFS='|' read -r flags value desc; do
+    for f in $flags; do
+      if [[ $f == "$1" ]]; then
+        echo "$flags"
+        return 0
+      fi
+    done
+  done <<<"$2"
+  echo "$1"
+}
+
+# For agent add's KEY, when $cur starts a location, or is the start of one and
+# of no file here: offers ssh:// with the hosts from ssh_hosts (and $cur's
+# USER@, if it has one), docker:// with the running containers and
+# docker-volume:// with the volumes, each with the usual key's path. Fails
+# otherwise.
+offer_locations() {
+  local scheme list w user='' path
+  local -a words=()
+  case $cur in
+    ssh://* | docker://* | docker-volume://*) ;;
+    *)
+      [[ -n $cur ]] || return 1
+      [[ ssh:// == "$cur"* || docker-volume:// == "$cur"* || docker:// == "$cur"* ]] || return 1
+      for w in "$cur"*; do [[ ! -e $w ]] || return 1; done
+      ;;
+  esac
+  [[ ! $cur =~ ^ssh://([^/@]*@) ]] || user=${BASH_REMATCH[1]}
+  for scheme in ssh docker docker-volume; do
+    [[ $scheme:// == "$cur"* || $cur == "$scheme://"* ]] || continue
+    # shellcheck disable=SC2088  # a path at the location
+    path='~/.ssh/id_ed25519.pub'
+    case $scheme in
+      ssh) list=$(ssh_hosts) ;;
+      docker) list=$(docker ps --format '{{.Names}}' 2>/dev/null) || true ;;
+      docker-volume)
+        list=$(docker volume ls -q 2>/dev/null) || true
+        path=.ssh/id_ed25519.pub
+        ;;
+    esac
+    while IFS= read -r w; do
+      [[ -z $w ]] || words+=("$scheme://$user$w/$path")
+    done <<<"$list"
+  done
+  offer ${words[@]+"${words[@]}"}
+}
+
+# Prints the names of the agents.
+agent_names() {
+  local f
+  for f in "$agents"/*; do
+    [[ -f $f && ${f##*/} =~ $agent_re ]] && printf '%s\n' "${f##*/}"
+  done
+  return 0
+}
+
+# `lend-ssh __complete WORDS...`, which the shim calls: prints the candidates
+# for the last word, given the words before it, one per line. It exits 1 where
+# the word is a file name: agent add's KEY unless offer_locations offers
+# locations, install's and uninstall's DIR, and grant's, revoke's or agent
+# show's AGENT when it looks like a path. An
+# account, [USER@]HOST, completes from the accounts set up from here for
+# grant and account reset, from those AGENT's certificate is for for revoke,
+# and from the hosts in ~/.ssh/config and ~/.ssh/known_hosts for account add
+# and account rm.
+cmd_complete() {
+  local cur cmd page word want='' positional=0 opts_done='' given='' strip='' table spec glue='' first=''
+  local -a words=()
+  # bash splits dave@host into dave, @ and host, and --id=x and a:b alike;
+  # this joins them back up.
+  for word in "$@"; do
+    if [[ -n $glue || $word == [@=:] ]] && ((${#words[@]})); then
+      words[${#words[@]}-1]+=$word
+    else
+      words+=("$word")
+    fi
+    if [[ $word == [@=:] ]]; then glue=1; else glue=''; fi
+  done
+  ((${#words[@]})) || words=('')
+  cur=${words[${#words[@]}-1]}
+  # bash replaces only its own current word, the last piece, with an @
+  # before it; after a : it replaces nothing.
+  if (($#)) && [[ ${!#} != "$cur" ]]; then
+    strip=${cur%"${!#}"}
+    strip=${strip%@}
+    [[ ${!#} != : ]] || strip=$cur
+  fi
+  if ((${#words[@]} == 1)); then
+    if [[ $cur == -* ]]; then offer_options ''; else offer_commands ''; fi
+    return 0
+  fi
+  cmd=${words[0]}
+  words=("${words[@]:1:${#words[@]}-2}")
+  case $cmd in
+    help | -h | --help)
+      if ((${#words[@]} == 0)); then
+        offer_commands ''
+      elif ((${#words[@]} == 1)) && is_noun "${words[0]}"; then
+        offer_commands "${words[0]}"
+      fi
+      return 0
+      ;;
+  esac
+  page=$cmd
+  if is_noun "$cmd"; then
+    if ((${#words[@]} == 0)); then
+      offer_commands "$cmd"
+      return 0
+    fi
+    page="$cmd ${words[0]}"
+    words=("${words[@]:1}")
+  fi
+  table=$(page_options "$page")
+  # The words before $cur as parse_options reads them: options until the
+  # first other word, or --.
+  for word in ${words[@]+"${words[@]}"}; do
+    if [[ -n $want ]]; then
+      want=''
+    elif [[ -z $opts_done && $word == -- ]]; then
+      opts_done=1
+    elif [[ -z $opts_done && $word == -?* ]]; then
+      want=$(wanted_value "$word" "$table")
+      [[ -n $want ]] || given+=" $(option_flags "$word" "$table")"
+    else
+      opts_done=1
+      ((positional)) || first=$word
+      positional=$((positional + 1))
+      given+=" $word"
+    fi
+  done
+  if [[ -n $want ]]; then
+    offer_values "$want" ''
+  elif [[ -z $opts_done && $cur == --*=* ]]; then
+    spec=$(option_spec "${cur%%=*}" "$table") && offer_values "${spec%%|*}" "${cur%%=*}="
+  elif [[ -z $opts_done && $cur == -* ]]; then
+    offer_options "$page"
+  else
+    case $page:$positional in
+      grant:0 | revoke:0 | 'agent show:0')
+        [[ $cur != */* && $cur != [.~]* ]] || return 1
+        # shellcheck disable=SC2046  # agent names are words
+        offer $(agent_names)
+        ;;
+      install:0 | uninstall:0) return 1 ;;
+      'agent add:1') offer_locations || return 1 ;;
+      'agent rm:'*)
+        # shellcheck disable=SC2046
+        offer $(agent_names)
+        ;;
+      grant:* | 'account reset:'*) offer_named_accounts "$(open_accounts)" ;;
+      revoke:*) offer_named_accounts "$(granted_accounts "$first")" ;;
+      'account add:'* | 'account rm:'*) offer_accounts ;;
+    esac
+  fi
+  return 0
+}
+
+# The certificate's forced command runs this sh script on the host for every
+# session, with the deadline (seconds since the epoch) as $1, the CA's public
+# key as $2 and the certificate's principals after them. It refuses the
+# session after the deadline, and otherwise runs what was asked for (the
+# login shell, a command, or sftp, whose internal-sftp it can only run as an
+# sftp-server program) and at the deadline sends it SIGHUP, and SIGKILL 10
+# seconds later: with GNU timeout, else with perl. A session with no terminal
+# gets the signals as a process group. While ~/.ssh/authorized_keys trusts
+# the CA under one of the principals, a watcher checks it every 10 seconds
+# and sends the session the same signals once it no longer does. The script
+# has no single quote, to go inside one.
+read -r -d '' deadline_script <<'EOF' || true
+d=$1 b=$2
+shift 2
+ps=$*
+left=$((d - $(date +%s)))
+if [ "$left" -le 0 ]; then echo "lend-ssh: this certificate has expired" >&2; exit 1; fi
+f=$HOME/.ssh/authorized_keys
+trusted() {
+  t=$(grep -F "$b" "$f" 2>/dev/null) || return 1
+  for p in $ps; do
+    case $t in *"principals=\"$p\""*) return 0 ;; esac
+  done
+  return 1
+}
+if trusted; then
+  (
+    while sleep 10; do
+      kill -0 $$ 2>/dev/null || exit 0
+      trusted && continue
+      kill -s HUP $$
+      sleep 10
+      kill -s KILL -- -$$ 2>/dev/null
+      kill -s KILL $$ 2>/dev/null
+      exit 0
+    done
+  ) </dev/null >/dev/null 2>&1 &
+fi
+c=${SSH_ORIGINAL_COMMAND-}
+if [ "$c" = internal-sftp ]; then
+  for c in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/libexec/sftp-server /usr/lib/ssh/sftp-server; do
+    [ -x "$c" ] && break
+  done
+fi
+if [ -n "$c" ]; then set -- "$SHELL" -c "$c"; else set -- "$SHELL" -l; fi
+group=1
+[ -t 0 ] && group=0
+if timeout --version 2>/dev/null | grep -q GNU; then
+  [ $group = 1 ] || exec timeout --foreground -s HUP -k 10 "$left" "$@"
+  exec timeout -s HUP -k 10 "$left" "$@"
+fi
+if command -v perl >/dev/null 2>&1; then
+  exec perl -e "(\$t, \$g) = splice @ARGV, 0, 2; \$p = fork; if (!\$p) { setpgrp if \$g; exec @ARGV; exit 127 } \$k = \$g ? -\$p : \$p; sub stop { kill HUP => \$k; \$SIG{ALRM} = sub { kill KILL => \$k }; alarm 10 } \$SIG{ALRM} = \$SIG{HUP} = \\&stop; alarm \$t; do { \$r = waitpid \$p, 0 } until \$r == \$p || !\$!{EINTR}; exit(\$? & 127 ? 128 + (\$? & 127) : \$? >> 8)" "$left" "$group" "$@"
+fi
+echo "lend-ssh: this host has neither GNU timeout nor perl to end the session at the deadline" >&2
+exit 1
+EOF
+
+# Prints the seconds in TIME, as -t takes it: 30m, 4h, 1h30m, 2d, 1w.
+seconds() {
+  local time=$1 total=0 n unit
+  while [[ $time =~ ^([0-9]+)([smhdwSMHDW]?)(.*)$ ]]; do
+    n=$((10#${BASH_REMATCH[1]})) unit=${BASH_REMATCH[2]} time=${BASH_REMATCH[3]}
+    case $unit in
+      '' | s | S) total=$((total + n)) ;;
+      m | M) total=$((total + n * 60)) ;;
+      h | H) total=$((total + n * 3600)) ;;
+      d | D) total=$((total + n * 86400)) ;;
+      w | W) total=$((total + n * 604800)) ;;
+    esac
+  done
+  echo "$total"
+}
+
+# True when $1 names an agent.
+is_agent() {
+  [[ $1 =~ $agent_re && -f $agents/$1 ]]
+}
+
+# An agent is a file, $agents/NAME, holding its public key file's absolute
+# path; or a location, or "-" for a key given as text, whose public key
+# lend-ssh keeps as $agent_keys/NAME/key.pub; or, from older versions, the
+# public key itself.
+
+# Sets key, agent $1's public key file (or the public key itself), and to,
+# where else grant sends its certificate: a location, "-" for stdout, or
+# nothing.
+read_agent() {
+  local line
+  line=$(head -1 "$agents/$1")
+  to=''
+  if is_location "$line" || [[ $line == - ]]; then
+    key=$agent_keys/$1/key.pub to=$line
+  else
+    key=$line
+  fi
+}
+
+# Prints KEY, or if KEY names an agent, the agent's key: its public key
+# file's absolute path, or the public key itself.
+agent_key() {
+  local key to
+  if is_agent "$1"; then
+    read_agent "$1"
+    [[ $key != /* || -f $key ]] || die "agent $1's key $key is gone"
+    echo "$key"
+  else
+    echo "$1"
+  fi
+}
+
+# revoke and agent rm take a certificate back only from beside the key, so a
+# copy of it works until it expires. $revoked keeps a line for each account
+# taken back: "END PRINCIPAL NAME KEY", the certificate's end (YYYYMMDDHHMMSS,
+# or none), the account's principal, the agent's name (or the key ID) and its
+# public key file.
+
+# Prints the lines of $revoked whose certificates still work: not expired, for
+# an account not reset or removed since, and not outlasted by the key's
+# certificate now or a later line; one line per account and key.
+live_revoked() {
+  local end p name key now c_end c_id c_deadline
+  local -a c_principals c_exts c_crit
+  [[ -f $revoked ]] || return 0
+  now=$(date +%Y%m%d%H%M%S)
+  while read -r end p name key; do
+    [[ $end == none || $end > $now ]] || continue
+    [[ $(current_principal "${p%%#*}" 2>/dev/null) == "$p" ]] || continue
+    if cert_info "${key%.pub}-cert.pub" && cert_valid &&
+      [[ " ${c_principals[*]-} " == *" $p "* ]] &&
+      [[ -z $c_end || ($end != none && ! $end > $c_end) ]]; then
+      continue
+    fi
+    echo "$end $p $name $key"
+  done <"$revoked" | awk '{
+    k = $0; sub(/^[^ ]+ [^ ]+ [^ ]+ /, "", k); k = $2 " " k
+    if (!(k in end) || $1 > end[k]) { end[k] = $1; line[k] = $0 }
+  } END { for (k in line) print line[k] }'
+}
+
+# record_revoked END NAME KEY PRINCIPAL...: notes that the certificate for
+# public key file KEY, ending END (empty for none), was taken back from these
+# principals, and drops the lines that no longer work.
+record_revoked() {
+  local end=${1:-none} name=${2//[^A-Za-z0-9._@-]/_} key=$3 p
+  shift 3
+  name=${name:-agent}
+  mkdir -p "$config"
+  { live_revoked
+    for p in "$@"; do echo "$end $p $name $key"; done
+  } >"$revoked.new"
+  mv "$revoked.new" "$revoked"
+}
+
+# Prints the absolute path of existing file $1.
+abs_path() {
+  echo "$(cd "$(dirname "$1")" && pwd -P)/${1##*/}"
+}
+
+# Prints end $1 (YYYYMMDDHHMMSS, or empty or none) for people: " until TIME",
+# or ", no expiry".
+until_text() {
+  if [[ -z $1 || $1 == none ]]; then echo ', no expiry'; else echo " until $(show_time "$1")"; fi
+}
+
+# Prints lines $1, "END PRINCIPAL ...", as "ACCOUNTS (revoked) until TIME", a
+# line per end.
+revoked_groups() {
+  local end p last='' shown=''
+  while read -r end p _; do
+    [[ -n $end ]] || continue
+    if [[ $end != "$last" && -n $shown ]]; then
+      echo "$shown$(until_text "$last")"
+      shown=''
+    fi
+    last=$end
+    shown+="${shown:+ }${p%%#*} (revoked)"
+  done < <(sort <<<"$1")
+  [[ -z $shown ]] || echo "$shown$(until_text "$last")"
+}
+
+# Prints what certificate $1 opens and until when, then the accounts taken
+# back from it whose copies still work, from live_revoked lines $2, a line
+# per end; or "no grant" when there's neither. An account cancelled since
+# shows as cancelled.
+cert_status() {
+  local key=${1%-cert.pub}.pub c_end c_id c_deadline p end name k mine='' rest='' shown='' out
+  local -a c_principals c_exts c_crit
+  while read -r end p name k; do
+    [[ -z $end || $k != "$key" ]] || mine+="$end $p"$'\n'
+  done <<<"${2:-}"
+  if cert_info "$1" && cert_valid; then
+    for p in ${c_principals[@]+"${c_principals[@]}"}; do
+      if [[ $(current_principal "${p%%#*}" 2>/dev/null) == "$p" ]]; then
+        shown+=" ${p%%#*}"
+      else
+        shown+=" ${p%%#*} (cancelled)"
+      fi
+    done
+    while read -r end p; do
+      [[ -n $end ]] || continue
+      if [[ $end == "${c_end:-none}" ]]; then shown+=" ${p%%#*} (revoked)"; else rest+="$end $p"$'\n'; fi
+    done <<<"$mine"
+    echo "${shown# }$(until_text "$c_end")$([[ -z $c_end || -n $c_deadline ]] || echo ', no session deadline')"
+  else
+    rest=$mine
+    out=$(revoked_groups "$rest")
+    [[ -n $out ]] || out="no grant"
+    echo "$out"
+    return
+  fi
+  revoked_groups "$rest"
+}
+
+cmd_agent() {
+  [[ $# -eq 0 ]] || usage_error "unknown agent command '$1' ($(verbs agent), or none to list)"
+  local f name key to found='' live text
+  live=$(live_revoked)
+  for f in "$agents"/*; do
+    [[ -f $f ]] || continue
+    found=1
+    name=${f##*/}
+    read_agent "${f##*/}"
+    if [[ $key == /* ]]; then
+      if [[ $to == - ]]; then
+        text=$(head -1 "$key")
+        printf '%s\t%s\n' "$name" "${text:0:40}... (given as text: grant prints its certificate)"
+      else
+        printf '%s\t%s\n' "$name" "${to:-$(tildify "$key")}"
+      fi
+      cert_status "${key%.pub}-cert.pub" "$live" | sed $'s/^/\t/'
+    else
+      printf '%s\t%s\n\t%s\n' "$name" "${key:0:40}..." "given as text: grant prints its certificate"
+    fi
+  done
+  [[ -n $found ]] || echo "No agents. '$prog agent add NAME KEY' adds one."
+}
+
+# Dies if agent $1 has a valid certificate that agent add would leave behind:
+# unless $2 is "copy" and public key file $3 is the same key, for an agent
+# whose certificate lend-ssh keeps a copy of, which goes to the new location;
+# or $2 is "here" and $3 is the same key file, for an agent whose key is here.
+check_replace() {
+  local key to c_end c_id c_deadline
+  local -a c_principals c_exts c_crit
+  is_agent "$1" || return 0
+  read_agent "$1"
+  [[ $key == /* ]] && cert_info "${key%.pub}-cert.pub" && cert_valid || return 0
+  if [[ -n ${3:-} ]]; then
+    if [[ -n $to ]]; then
+      [[ $2 != copy || $(cut -d' ' -f2 "$3") != $(cut -d' ' -f2 "$key") ]] || return 0
+    else
+      [[ $2 != here || $3 != "$key" ]] || return 0
+    fi
+  fi
+  die "agent $1 has a grant$(until_text "$c_end"); '$prog revoke $1' first"
+}
+
+# For agent add NAME LOCATION ($1, $2): sets to to the location of the public
+# key, and copies the key to $3/key.pub; first creating a key there, as agent
+# add does, if it has none.
+add_at_location() {
+  local name=$1 loc=$2 tmp=$3 loc_kind loc_where loc_path pub priv status=0 out dir
+  parse_location "$loc"
+  if [[ $loc_path == *.pub ]]; then pub=$loc_path; else pub=$loc_path.pub; fi
+  priv=${pub%.pub}
+  to=${loc%"$loc_path"}$pub
+  probe_script "$(loc_sh "$pub")" "$(loc_sh "$priv")" | at_location >"$tmp/key.pub" || status=$?
+  case $status in
+    0)
+      ssh-keygen -l -f "$tmp/key.pub" >/dev/null 2>&1 || die "$to isn't a public key"
+      check_replace "$name" copy "$tmp/key.pub"
+      return
+      ;;
+    73) die "no public key at $to" ;;
+    74) ;;
+    *) die "couldn't read $to" ;;
+  esac
+  check_replace "$name"
+  rm -f "$tmp/key.pub"
+  ssh-keygen -q -t ed25519 -N '' -C "$name@lend-ssh" -f "$tmp/key" </dev/null
+  dir=${to%/*}
+  status=0
+  out=$(put_script "$(loc_sh "$priv")" "$tmp/key" "$(loc_sh "$pub")" "$tmp/key.pub" | at_location) || status=$?
+  case $status in
+    0) ;;
+    75) die "no directory ${dir%/*} to create a key in" ;;
+    76) die "$dir already has $(sed 's/ *$//; s/ /, /g' <<<"$out"); name that key, or create a new one there with ssh-keygen" ;;
+    *) die "couldn't create a key at ${to%.pub}" ;;
+  esac
+  echo "created a key at ${to%.pub}, without a passphrase"
+}
+
+cmd_agent_add() {
+  local force='' name key pub priv to='' tmp old_to='' cert c_end c_id c_deadline
+  local -a c_principals c_exts c_crit
+  ! opt_value -f >/dev/null || force=1
+  [[ $# -eq 2 ]] || usage_error "agent add takes a NAME and a KEY"
+  name=$1 key=$2
+  [[ $name =~ $agent_re ]] || usage_error "'$name' can't be an agent's name (letters, digits, '_' and '-', not starting with '-')"
+  [[ ! -e $agents/$name || -n $force ]] || die "there's already an agent $name; 'agent add -f' replaces it"
+  if is_agent "$name"; then old_to=$(read_agent "$name" && echo "$to"); fi
+  tmp=$(mktemp -d)
+  # shellcheck disable=SC2064  # expand $tmp now
+  trap "rm -rf '$tmp'" EXIT
+  priv=${key%.pub}
+  if is_location "$key"; then
+    add_at_location "$name" "$key" "$tmp"
+    pub=''
+  elif is_pubkey_text "$key" && [[ ! -e $key && ! -e $key.pub ]]; then
+    pubkey_text "$key" >"$tmp/key.pub"
+    to=- pub=''
+    check_replace "$name" copy "$tmp/key.pub"
+  elif [[ -e $key || -e $key.pub ]]; then
+    pub=$(pubkey_of "$key")
+    check_replace "$name" here "$(abs_path "$pub")"
+  elif [[ -e $priv ]]; then
+    die "no public key at $priv.pub"
+  elif [[ $key != */* ]] && known_host "$key"; then
+    # shellcheck disable=SC2088  # a path at the location
+    add_at_location "$name" "ssh://$key/~/.ssh/id_ed25519.pub" "$tmp"
+    pub=''
+  elif ! is_pubkey_text "$key" && [[ $key == */* ]]; then
+    # A mistyped path would quietly make a new key, so it's made only where
+    # the directory's parent exists, and not beside other keys.
+    local dir others='' f
+    dir=$(dirname "$priv")
+    [[ -d $dir || -d $(dirname "$dir") ]] || die "no directory $(tildify "$(dirname "$dir")") to create a key in"
+    for f in "$dir"/*.pub; do
+      [[ ! -e $f ]] || others+=", ${f##*/}"
+    done
+    others=${others#, }
+    [[ -z $others ]] ||
+      die "$(tildify "$dir") already has $others; name that key, or create a new one there with ssh-keygen"
+    check_replace "$name"
+    (umask 077 && mkdir -p "$dir")
+    ssh-keygen -q -t ed25519 -N '' -C "$name@lend-ssh" -f "$priv" </dev/null
+    echo "created a key at $(tildify "$priv"), without a passphrase"
+    pub=$priv.pub
+  else
+    die "'$key' is neither a key file, a public key nor a host ssh knows; for a new key, give a path with a /, such as ./$key"
+  fi
+  mkdir -p "$agents"
+  if [[ -n $pub ]]; then
+    key=$(cd "$(dirname "$pub")" && pwd -P)/${pub##*/}
+    rm -rf "${agent_keys:?}/$name"
+    printf '%s\n' "$key" >"$agents/$name"
+    echo "added agent $name: $(tildify "$key")"
+    return
+  fi
+  # The same key keeps its certificate, which goes to a new location.
+  cert=$agent_keys/$name/key-cert.pub
+  if [[ ! -f $agent_keys/$name/key.pub || $(cut -d' ' -f2 "$tmp/key.pub") != $(cut -d' ' -f2 "$agent_keys/$name/key.pub") ]]; then
+    rm -rf "${agent_keys:?}/$name"
+    mkdir -p "$agent_keys/$name"
+    cp "$tmp/key.pub" "$agent_keys/$name/key.pub"
+  fi
+  # The certificate leaves the old location before it goes to the new one,
+  # which may be the same file by another name.
+  local move=''
+  if [[ $to != "$old_to" && -f $cert ]] && cert_info "$cert" && cert_valid; then
+    move=1
+    if is_location "$old_to"; then
+      send_cert "$old_to" ||
+        die "couldn't remove $name's certificate at $old_to, so the agent is still there"
+      echo "removed its certificate at $old_to"
+    fi
+  fi
+  printf '%s\n' "$to" >"$agents/$name"
+  if [[ $to == - ]]; then
+    echo "added agent $name: $(cat "$tmp/key.pub")"
+  else
+    echo "added agent $name: $to"
+  fi
+  [[ -n $move ]] || return 0
+  if [[ $to == - ]]; then
+    echo "its certificate, $(cert_status "$cert"):"
+    cat "$cert"
+  else
+    send_cert "$to" "$cert" || die "couldn't write $name's certificate to $to; grant again to retry"
+    echo "sent its certificate, $(cert_status "$cert"), to $to"
+  fi
+}
+
+# Removing an agent deletes its certificate first, as revoke would.
+cmd_agent_rm() {
+  local name key to cert c_end c_id c_deadline failed=''
+  local -a c_principals c_exts c_crit
+  [[ $# -gt 0 ]] || usage_error "agent rm takes the agents' names"
+  for name in "$@"; do
+    [[ $name =~ $agent_re && -f $agents/$name ]] || die "no agent $name"
+  done
+  for name in "$@"; do
+    read_agent "$name"
+    cert=${key%.pub}-cert.pub
+    if [[ $key == /* && -f $cert ]]; then
+      if cert_info "$cert" && cert_valid; then
+        echo "$name: $(cert_status "$cert") -> revoked"
+        record_revoked "$c_end" "$name" "$key" "${c_principals[@]}"
+        if is_location "$to" && ! send_cert "$to"; then
+          echo "$prog: couldn't remove the certificate at $to, so it still works there$(until_text "$c_end")" >&2
+          failed=1
+        fi
+      fi
+      rm "$cert"
+    fi
+    [[ -z $to ]] || rm -rf "${agent_keys:?}/$name"
+    rm "$agents/$name"
+    echo "removed agent $name"
+  done
+  [[ -z $failed ]]
+}
+
+cmd_agent_show() {
+  [[ $# -eq 1 ]] || usage_error "agent show takes one AGENT"
+  local cert
+  cert=$(agent_key "$1")
+  if [[ $cert != "$1" && $cert != /* ]]; then
+    die "agent $1's key isn't a file, so there's no certificate beside it"
+  fi
+  if [[ $cert != *-cert.pub ]]; then
+    cert=$(pubkey_of "$cert")
+    cert=${cert%.pub}-cert.pub
+  fi
+  [[ -f $cert ]] || die "no certificate at $cert"
+  cert_info "$cert" || die "$cert isn't a certificate"
+  if [[ -z $c_deadline ]]; then
+    ssh-keygen -L -f "$cert"
+    return
+  fi
+  # lend-ssh's forced command runs from its first line to the one that ends
+  # the script and gives its arguments; it shows as one line.
+  ssh-keygen -L -f "$cert" | awk -v deadline="$(show_time "$(stamp "$c_deadline")")" '
+    !skip && index($0, "                force-command /bin/sh -c '\''d=$1 ") == 1 {
+      print "                force-command (lend-ssh session deadline, " deadline ")"
+      skip = 1
+    }
+    skip { if ($0 ~ /'\'' lend-ssh [0-9]+ /) skip = 0; next }
+    { print }'
+}
+
+[[ $# -gt 0 ]] || { usage >&2; exit 2; }
+cmd=$1
+shift
+help_key=''
+case $cmd in
+  __complete)
+    cmd_complete "$@"
+    exit
+    ;;
+  help | -h | --help)
+    # -h or --help after help asks for help's own page, or COMMAND's.
+    words=()
+    for arg in "$@"; do
+      [[ $arg == -h || $arg == --help ]] || words+=("$arg")
+    done
+    if [[ ${#words[@]} -gt 0 ]]; then
+      command_help "${words[*]}"
+    elif [[ $# -gt 0 && $cmd == help ]]; then
+      command_help help
+    else
+      usage
+    fi
+    exit 0
+    ;;
+  -*) usage_error "unknown option $cmd" ;;
+esac
+[[ $cmd =~ ^[a-z]+$ && -n $(command_lines "$cmd") ]] || usage_error "unknown command '$cmd'"
+help_key=$cmd
+if is_noun "$cmd" && [[ ${1:-} =~ ^[a-z]+$ && -n $(command_lines "$cmd $1") ]]; then
+  help_key="$cmd $1"
+  shift
+fi
+for arg in "$@"; do
+  [[ $arg == -- ]] && break
+  if [[ $arg == -h || $arg == --help ]]; then
+    command_help "$help_key"
+    exit 0
+  fi
+done
+parse_options "$help_key" "$@"
+"cmd_${help_key// /_}" ${args[@]+"${args[@]}"}
