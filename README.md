@@ -254,16 +254,26 @@ A PATH starting with `~/` is in the home directory there, and any other from
 this machine, sends both halves there over `ssh` or `docker`, and deletes
 them here.
 
-For a host you've connected to before, `[USER@]HOST` alone will do:
+Over ssh, `[USER@]HOST:PATH` works as it does for `scp`, with PATH from the
+home directory there unless it starts with `/`; `[USER@]HOST:` alone takes the
+agent's usual key:
 
 ```sh
-lend-ssh agent add claude agentbox    # ssh://agentbox/~/.ssh/id_ed25519.pub
+lend-ssh agent add claude agentbox:              # its usual key
+lend-ssh agent add claude agentbox:keys/ci.pub   # ssh://agentbox/~/keys/ci.pub
 ```
 
-lend-ssh takes it as a host when it isn't a file here, and the host is a
-`Host` in your `~/.ssh/config` or is in your `known_hosts`, at the host name
-and port your ssh config gives it. ssh then logs in as it would for
-`ssh agentbox`.
+The usual key is the first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub` and
+`id_rsa.pub` there; with none of them, `agent add` creates
+`~/.ssh/id_ed25519`. For a host you've connected to before, `[USER@]HOST`
+alone does the same: lend-ssh takes it as a host when it isn't a file here,
+and the host is a `Host` in your `~/.ssh/config` or is in your `known_hosts`,
+at the host name and port your ssh config gives it. ssh then logs in as it
+would for `ssh agentbox`.
+
+The agent uses its key unattended, so `agent add` warns when an existing key
+has a passphrase, which only an ssh-agent can then supply. It checks with
+`ssh-keygen` where the private key is, if that machine has it.
 
 `grant` and `revoke` then write the certificate there. lend-ssh keeps a copy
 of it, and of the public key, in `~/.config/lend-ssh/keys`, so `agent` and

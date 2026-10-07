@@ -127,15 +127,21 @@ file that this machine reaches with ssh or docker:
 
 PATH starts at /, or with ~/ at the home directory there, as in
 docker://box/~/.ssh/id_ed25519.pub; in a volume, it starts at the volume's
-top. Set LEND_SSH_VOLUME_IMAGE for another image than alpine. KEY can be
-[USER@]HOST alone, for ssh://[USER@]HOST/~/.ssh/id_ed25519.pub, when HOST is
-in your ~/.ssh/config or known_hosts.
+top. Set LEND_SSH_VOLUME_IMAGE for another image than alpine.
+
+KEY can be [USER@]HOST:PATH, as for scp, over ssh: PATH starts at the home
+directory there, or at / when it starts with /. [USER@]HOST: alone means
+the agent's usual key there: ~/.ssh/id_ed25519.pub, else id_ecdsa.pub, else
+id_rsa.pub, else a new ~/.ssh/id_ed25519. So does [USER@]HOST alone, when
+HOST is in your ~/.ssh/config or known_hosts.
 
 When KEY is a path with no file there yet, agent add creates a key, without a
 passphrase, as the agent uses it unattended. It does so only in an existing
 directory, or a new one inside an existing directory, and not beside other
 keys. For a location, it creates the key on this machine, writes it there, and
-deletes it here.
+deletes it here. It warns when ssh-keygen, where the private key is, finds
+that an existing key has a passphrase, as the agent can then use it only
+through an ssh-agent.
 
 -f replaces agent NAME. While NAME has a valid certificate, it takes only the
 same key: at the same path here, or for an agent at a location or given as
@@ -831,13 +837,41 @@ sh_contents() {
   printf 'LEND_SSH_EOF\n)\n'
 }
 
-# A sh script that prints the public key at path $1 (as loc_sh gives it), or
-# exits 73 if there's none but the private key $2 is there, else 74.
+# A sh script that prints the public key at the first of paths $@ (as
+# loc_path is, ending .pub) that has one, after a line of its number (from 1) and
+# "passphrase" if ssh-keygen there finds the private key beside it has one,
+# else "-". With none, it prints the number of the first path that has a
+# private key beside it and exits 73, or exits 74.
 probe_script() {
-  printf 'pub=%s\npriv=%s\n' "$1" "$2"
+  local i=0 p
+  for p in "$@"; do
+    i=$((i + 1))
+    printf 'pub%s=%s\npriv%s=%s\n' "$i" "$(loc_sh "$p")" "$i" "$(loc_sh "${p%.pub}")"
+  done
+  echo "n=$i"
   cat <<'EOF2'
-if [ -f "$pub" ]; then cat "$pub"; exit; fi
-if [ -e "$priv" ]; then exit 73; fi
+i=1
+while [ "$i" -le "$n" ]; do
+  eval 'pub=$pub'"$i"' priv=$priv'"$i"
+  if [ -f "$pub" ]; then
+    s=-
+    if [ -f "$priv" ] && command -v ssh-keygen >/dev/null 2>&1; then
+      case $(ssh-keygen -y -P '' -f "$priv" 2>&1 </dev/null >/dev/null) in
+        *passphrase*) s=passphrase ;;
+      esac
+    fi
+    echo "$i $s"
+    cat "$pub"
+    exit
+  fi
+  i=$((i + 1))
+done
+i=1
+while [ "$i" -le "$n" ]; do
+  eval 'priv=$priv'"$i"
+  if [ -e "$priv" ]; then echo "$i"; exit 73; fi
+  i=$((i + 1))
+done
 exit 74
 EOF2
 }
@@ -846,7 +880,7 @@ EOF2
 # and file in $@, the file's contents to the path. A file ending -cert.pub or
 # .pub is readable by all, and replaces what's there; another is readable only
 # by its owner, and is written beside no other public key: if there are
-# others, the script prints their names and exits 76. It writes into an
+# others, the script prints their names, one per line, and exits 76. It writes into an
 # existing directory, or one it makes in an existing directory, else exits 75.
 # Its files and any directory it makes belong to the owner of the directory
 # they're in.
@@ -872,8 +906,7 @@ put() {
   case $1 in
     *.pub) umask 022 ;;
     *)
-      o=''
-      for k in "$d"/*.pub; do [ ! -e "$k" ] || o="$o${k##*/} "; done
+      o=$(for k in "$d"/*.pub; do [ ! -e "$k" ] || echo "${k##*/}"; done)
       [ -z "$o" ] || { echo "$o"; exit 76; }
       umask 077
       ;;
@@ -1654,20 +1687,20 @@ option_flags() {
   echo "$1"
 }
 
-# For agent add's KEY, when $cur starts a location, or is the start of one and
-# of no file here: offers ssh:// with the hosts from ssh_hosts (and $cur's
-# USER@, if it has one), docker:// with the running containers and
-# docker-volume:// with the volumes, each with the usual key's path. Fails
-# otherwise.
+# For agent add's KEY, when $cur starts a location, or has no /, doesn't start
+# with ., ~ or $, and is the start of no file here: offers ssh:// with the hosts from ssh_hosts (and
+# $cur's USER@, if it has one), docker:// with the running containers and
+# docker-volume:// with the volumes, each with the usual key's path, and,
+# when $cur has no colon, [USER@]HOST from ssh_hosts. Fails otherwise.
 offer_locations() {
   local scheme list w user='' path
   local -a words=()
   case $cur in
     ssh://* | docker://* | docker-volume://*) ;;
     *)
-      [[ -n $cur ]] || return 1
-      [[ ssh:// == "$cur"* || docker-volume:// == "$cur"* || docker:// == "$cur"* ]] || return 1
+      [[ -n $cur && $cur != */* && $cur != [.~\$]* ]] || return 1
       for w in "$cur"*; do [[ ! -e $w ]] || return 1; done
+      [[ $cur == *:* ]] || offer_accounts
       ;;
   esac
   [[ ! $cur =~ ^ssh://([^/@]*@) ]] || user=${BASH_REMATCH[1]}
@@ -2065,39 +2098,125 @@ check_replace() {
   die "agent $1 has a grant$(until_text "$c_end"); '$prog revoke $1' first"
 }
 
-# For agent add NAME LOCATION ($1, $2): sets to to the location of the public
-# key, and copies the key to $3/key.pub; first creating a key there, as agent
-# add does, if it has none.
+# Location $1 as [USER@]HOST:PATH, where it can be: an ssh:// location with no
+# port, with PATH relative in the home directory and absolute from /.
+short_location() {
+  local loc_kind loc_where loc_path
+  parse_location "$1"
+  if [[ $loc_kind != ssh || $loc_where == *:* ]]; then
+    echo "$1"
+  elif [[ $loc_path == \~/* ]]; then
+    echo "$loc_where:${loc_path#\~/}"
+  else
+    echo "$loc_where:/$loc_path"
+  fi
+}
+
+# Dies that directory $1, where agent add would create agent $3's key, has
+# public keys $2 (names, one per line), giving the agent add command for the
+# first of them, at path $4, when the path needs no quoting.
+die_beside() {
+  local keys hint
+  keys=$(paste -sd, - <<<"$2" | sed 's/,/, /g')
+  if [[ ! $4 =~ ^[A-Za-z0-9._@+/:~-]+$ ]]; then
+    hint="give its path as KEY"
+  elif [[ $2 == *$'\n'* ]]; then
+    hint="to use one: '$prog agent add ${force:+-f }$3 $4'"
+  else
+    hint="to use it: '$prog agent add ${force:+-f }$3 $4'"
+  fi
+  die "$1 already has $keys; $hint, or create a new key there with ssh-keygen"
+}
+
+# Warns that the private key for public key $1 has a passphrase.
+warn_passphrase() {
+  echo "$prog: the private key for $1 has a passphrase, so the agent can use it only through an ssh-agent" >&2
+}
+
+# For agent add NAME TMP LOCATION ($1, $2, $3): sets to to the location of the
+# public key, and copies the key to $2/key.pub; first creating a key there, as
+# agent add does, if it has none. Further arguments are other paths at the
+# same place, as loc_path is: it takes the first of LOCATION's path and those
+# that has a public key, and creates a key only at LOCATION.
 add_at_location() {
-  local name=$1 loc=$2 tmp=$3 loc_kind loc_where loc_path pub priv status=0 out dir
+  local name=$1 tmp=$2 loc=$3 loc_kind loc_where loc_path base p i lock status=0 out dir
+  local -a pubs=()
+  shift 3
   parse_location "$loc"
-  if [[ $loc_path == *.pub ]]; then pub=$loc_path; else pub=$loc_path.pub; fi
-  priv=${pub%.pub}
-  to=${loc%"$loc_path"}$pub
-  at_location <<<"$(probe_script "$(loc_sh "$pub")" "$(loc_sh "$priv")")" >"$tmp/key.pub" || status=$?
+  base=${loc%"$loc_path"}
+  for p in "$loc_path" "$@"; do
+    [[ $p == *.pub ]] || p=$p.pub
+    pubs+=("$p")
+  done
+  at_location <<<"$(probe_script "${pubs[@]}")" >"$tmp/probe" || status=$?
+  # The location's first line is a number in pubs, checked before it goes in
+  # a subscript, where bash would run any command substitution in it.
+  if [[ $status == 0 || $status == 73 ]]; then
+    i='' lock=''
+    read -r i lock <"$tmp/probe" || true
+    [[ $i =~ ^[1-9][0-9]{0,2}$ ]] && ((i <= ${#pubs[@]})) || status=1
+  fi
   case $status in
     0)
+      tail -n +2 "$tmp/probe" >"$tmp/key.pub"
+      to=$base${pubs[i - 1]}
       ssh-keygen -l -f "$tmp/key.pub" >/dev/null 2>&1 || die "$to isn't a public key"
       check_replace "$name" copy "$tmp/key.pub"
+      [[ $lock != passphrase ]] || warn_passphrase "$to"
       return
       ;;
-    73) die "no public key at $to" ;;
+    73) die "no public key at $base${pubs[i - 1]}" ;;
     74) ;;
-    *) die "couldn't read $to" ;;
+    *) die "couldn't read $base${pubs[0]}" ;;
   esac
+  to=$base${pubs[0]}
   check_replace "$name"
-  rm -f "$tmp/key.pub"
   ssh-keygen -q -t ed25519 -N '' -C "$name@lend-ssh" -f "$tmp/key" </dev/null
   dir=${to%/*}
   status=0
-  out=$(at_location <<<"$(put_script "$(loc_sh "$priv")" "$tmp/key" "$(loc_sh "$pub")" "$tmp/key.pub")") || status=$?
+  out=$(at_location <<<"$(put_script "$(loc_sh "${pubs[0]%.pub}")" "$tmp/key" "$(loc_sh "${pubs[0]}")" "$tmp/key.pub")") || status=$?
   case $status in
     0) ;;
     75) die "no directory ${dir%/*} to create a key in" ;;
-    76) die "$dir already has $(sed 's/ *$//; s/ /, /g' <<<"$out"); name that key, or create a new one there with ssh-keygen" ;;
+    76)
+      IFS= read -r p <<<"$out"
+      if [[ $p =~ ^[A-Za-z0-9._@+-]+$ ]]; then p=$(short_location "$dir/$p"); else p=''; fi
+      die_beside "$dir" "$out" "$name" "$p"
+      ;;
     *) die "couldn't create a key at ${to%.pub}" ;;
   esac
   echo "created a key at ${to%.pub}, without a passphrase"
+}
+
+# The keys agent add looks for at [USER@]HOST alone, in order: the ones ssh
+# tries by default, less DSA and security keys. It creates the first when
+# there's none.
+# shellcheck disable=SC2088  # paths at the location
+default_keys=('~/.ssh/id_ed25519.pub' '~/.ssh/id_ecdsa.pub' '~/.ssh/id_rsa.pub')
+
+# True when $1 is [USER@]HOST:[PATH], as scp takes it: a colon before any /.
+is_host_path() {
+  [[ $1 =~ ^([A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*: ]]
+}
+
+# For agent add NAME TMP KEY, with KEY [USER@]HOST alone or [USER@]HOST:[PATH]:
+# add_at_location at the ssh:// location for it, or with no PATH, for the
+# default keys there.
+add_at_host() {
+  local host=${3%%:*} path=''
+  [[ $3 != *:* ]] || path=${3#*:}
+  case $path in
+    '') add_at_location "$1" "$2" "ssh://$host/${default_keys[0]}" "${default_keys[@]:1}" ;;
+    *[!0-9]*)
+      case $path in
+        /*) ;;
+        \~/*) path=/$path ;;
+        *) path=/~/$path ;;
+      esac
+      add_at_location "$1" "$2" "ssh://$host$path"
+      ;;
+    *) die "'$3' is HOST:PATH, with PATH a file in the home directory there; for a port, give ssh://$host:$path/PATH" ;;
+  esac
 }
 
 cmd_agent_add() {
@@ -2114,7 +2233,7 @@ cmd_agent_add() {
   trap "rm -rf '$tmp'" EXIT
   priv=${key%.pub}
   if is_location "$key"; then
-    add_at_location "$name" "$key" "$tmp"
+    add_at_location "$name" "$tmp" "$key"
     pub=''
   elif is_pubkey_text "$key" && [[ ! -e $key && ! -e $key.pub ]]; then
     pubkey_text "$key" >"$tmp/key.pub"
@@ -2123,11 +2242,13 @@ cmd_agent_add() {
   elif [[ -e $key || -e $key.pub ]]; then
     pub=$(pubkey_of "$key")
     check_replace "$name" here "$(abs_path "$pub")"
+    [[ ! -f ${pub%.pub} ]] ||
+      [[ $(ssh-keygen -y -P '' -f "${pub%.pub}" 2>&1 </dev/null >/dev/null) != *passphrase* ]] ||
+      warn_passphrase "$(tildify "$(abs_path "$pub")")"
   elif [[ -e $priv ]]; then
     die "no public key at $priv.pub"
-  elif [[ $key != */* ]] && known_host "$key"; then
-    # shellcheck disable=SC2088  # a path at the location
-    add_at_location "$name" "ssh://$key/~/.ssh/id_ed25519.pub" "$tmp"
+  elif is_host_path "$key" || { [[ $key != */* ]] && known_host "$key"; }; then
+    add_at_host "$name" "$tmp" "$key"
     pub=''
   elif ! is_pubkey_text "$key" && [[ $key == */* ]]; then
     # A mistyped path would quietly make a new key, so it's made only where
@@ -2136,18 +2257,20 @@ cmd_agent_add() {
     dir=$(dirname "$priv")
     [[ -d $dir || -d $(dirname "$dir") ]] || die "no directory $(tildify "$(dirname "$dir")") to create a key in"
     for f in "$dir"/*.pub; do
-      [[ ! -e $f ]] || others+=", ${f##*/}"
+      [[ ! -e $f ]] || others+=${f##*/}$'\n'
     done
-    others=${others#, }
-    [[ -z $others ]] ||
-      die "$(tildify "$dir") already has $others; name that key, or create a new one there with ssh-keygen"
+    if [[ -n $others ]]; then
+      others=$(printf %s "$others")
+      IFS= read -r f <<<"$others"
+      die_beside "$(tildify "$dir")" "$others" "$name" "$(tildify "$dir/$f")"
+    fi
     check_replace "$name"
     (umask 077 && mkdir -p "$dir")
     ssh-keygen -q -t ed25519 -N '' -C "$name@lend-ssh" -f "$priv" </dev/null
     echo "created a key at $(tildify "$priv"), without a passphrase"
     pub=$priv.pub
   else
-    die "'$key' is neither a key file, a public key nor a host ssh knows; for a new key, give a path with a /, such as ./$key"
+    die "'$key' is neither a key file, a public key nor a host ssh knows; for a host, give $key:, and for a new key, a path with a /, such as ./$key"
   fi
   mkdir -p "$agents"
   if [[ -n $pub ]]; then

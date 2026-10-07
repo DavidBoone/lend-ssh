@@ -130,13 +130,21 @@ script there, with the file's contents in the script:
 | `docker-volume://VOLUME/PATH` | `docker run --rm -i --network none -v VOLUME:/lend-ssh-volume alpine sh -s` |
 
 A PATH starting with `~/` is from the home directory there, and any other
-from `/`; in a volume, PATH is from the volume's top. `agent add` takes
-`[USER@]HOST` alone for `ssh://[USER@]HOST/~/.ssh/id_ed25519.pub` when no
-file of that name is here and ssh knows the host: it's a `Host` in
-`~/.ssh/config`, or `ssh-keygen -F` finds the host name and port that
-`ssh -G` gives for it (`[NAME]:PORT` for a port other than 22) in the
-`UserKnownHostsFile` or `GlobalKnownHostsFile` files that `ssh -G` names,
-hashed or not. A PATH is letters,
+from `/`; in a volume, PATH is from the volume's top.
+
+`agent add` also takes `[USER@]HOST:PATH`, a colon before any `/` as for
+`scp`, when no file of that name is here: `ssh://[USER@]HOST/~/PATH`, or
+`ssh://[USER@]HOST/PATH` for a PATH from `/`. A PATH of digits alone is
+refused, as it looks like a port. `[USER@]HOST:` alone stands for the
+default keys there: the first of `~/.ssh/id_ed25519.pub`, `~/.ssh/id_ecdsa.pub`
+and `~/.ssh/id_rsa.pub` that exists, read in one connection. When none does
+but one's private key does, it refuses, as for any private key with no
+public key; with none of them, it creates `~/.ssh/id_ed25519`. `[USER@]HOST`
+alone means the same when no file of that name is here and ssh knows the
+host: it's a `Host` in `~/.ssh/config`, or `ssh-keygen -F` finds the host
+name and port that `ssh -G` gives for it (`[NAME]:PORT` for a port other than
+22) in the `UserKnownHostsFile` or `GlobalKnownHostsFile` files that `ssh -G`
+names, hashed or not. A PATH is letters,
 digits and `._@+-/`. `LEND_SSH_VOLUME_IMAGE` sets another image than
 `alpine`, which needs `sh`, `ls`, `awk`, `chown` and `mv`. lend-ssh checks
 that the volume exists before it runs the container, since `docker run`
@@ -160,7 +168,11 @@ again retries. When `agent rm` can't, it notes the accounts as revoked, as
 for any copy, and forgets the agent; it reaches the location only for a
 valid certificate.
 
-`agent add` with a location reads the public key there once. While an agent
+`agent add` with a location reads the public key there once, and when the
+private key beside it is there too and so is `ssh-keygen`, runs
+`ssh-keygen -y -P ''` on it; when that reports a passphrase, `agent add`
+warns that the agent can use the key only through an ssh-agent. It checks a
+key here the same way. While an agent
 has a valid certificate, `agent add -f` refuses to replace it by another key,
 or by the same key somewhere the certificate wouldn't follow, since that
 would leave the certificate working where lend-ssh no longer looks. It takes
@@ -172,7 +184,8 @@ When `agent add` is given a path with no key there, it creates one, with no
 passphrase; for a location, it creates the key on this machine, writes both
 files there, and deletes them here. So that a mistyped path doesn't quietly
 make a new key, it does this only when the key's directory or that
-directory's parent exists, and the directory holds no other `.pub` file. A
+directory's parent exists, and the directory holds no other `.pub` file;
+when it holds one, the refusal gives the `agent add` command that takes it. A
 path for a new key must contain a `/`, such as `./id_ed25519.pub`.
 
 `grant`, `revoke` and `agent show` also take a key file's path in place of an
@@ -226,7 +239,11 @@ reset`, only the accounts set up from here are offered, and for `revoke`, only
 those the agent's certificate is for: each as a `Host` alias in
 `~/.ssh/config` that leads to it, else as its host alone when that leads to
 it, else as `USER@HOST`. Where an agent's name goes, a key file completes once the
-word looks like a path: it has a `/`, or starts with `.` or `~`. In zsh,
+word looks like a path: it has a `/`, or starts with `.` or `~`. `agent
+add`'s KEY completes as a file too, except for the start of a location
+(`ssh://` and the rest, with the hosts, running containers or volumes), or,
+when no file here starts with the word, as `[USER@]HOST` from the same hosts
+as `account add`. In zsh,
 commands and options are listed with what they do.
 
 `uninstall` removes the links `install` made in the directories on your
