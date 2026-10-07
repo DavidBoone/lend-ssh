@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # lend-ssh: lend an agent short-lived SSH access with OpenSSH user certificates.
 # Kept compatible with bash 3.2 (macOS).
+# With pipefail, grep -q doesn't go at a pipeline's end: it exits at the first
+# match, and the writer's SIGPIPE fails the pipeline. It reads a here-string.
 set -euo pipefail
 
 prog=${0##*/}
@@ -237,7 +239,7 @@ command_lines() {
 
 # True when $1 is a noun: a command with verbs.
 is_noun() {
-  [[ $1 != *' '* ]] && command_lines "$1" | cut -d'|' -f1 | grep -q "^$1 "
+  [[ $1 != *' '* ]] && grep -q "^$1 " <<<"$(command_lines "$1" | cut -d'|' -f1)"
 }
 
 # Prints noun $1's verbs, separated by commas.
@@ -456,7 +458,7 @@ ca_blob() {
 # Sets ca_args to ssh-keygen's arguments for signing with the CA: its copy in
 # your ssh-agent if it has one, else its private key file.
 ca_signer() {
-  if ssh-add -L 2>/dev/null | grep -qF " $(ca_blob)"; then
+  if grep -qF " $(ca_blob)" <<<"$(ssh-add -L 2>/dev/null)"; then
     ca_args=(-s "$ca.pub" -U)
   else
     [[ -f $ca ]] || die "the signing key isn't at $ca or in your ssh-agent"

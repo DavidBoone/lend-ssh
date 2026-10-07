@@ -16,13 +16,13 @@ lines() {
 }
 
 # me_line USER: me's own key is still in USER's authorized_keys on host1.
-me_line() { host1_keys "$1" | grep -q ' me@lender$'; }
+me_line() { host1_keys "$1" | grep ' me@lender$' >/dev/null; }
 
 # listed ACCOUNT TEXT: account lists TEXT on the line after ACCOUNT.
-listed() { "$lend_ssh" account | grep -A1 -xF "$1" | tail -n +2 | grep -qF "$2"; }
+listed() { "$lend_ssh" account | grep -A1 -xF "$1" | tail -n +2 | grep -F "$2" >/dev/null; }
 
 # unlisted ACCOUNT: account doesn't list ACCOUNT.
-unlisted() { ! "$lend_ssh" account | grep -qxF "$1"; }
+unlisted() { ! "$lend_ssh" account | grep -xF "$1" >/dev/null; }
 
 # acct_clean: removes the files the tests create in agent's home on agentbox.
 acct_clean() { as_agent agentbox sh -c 'rm -rf ~/acct ~/acct2 ~/acct-copy'; }

@@ -308,7 +308,7 @@ test_grant() {
   ssh-keygen -q -t rsa -b 2048 -N '' -f "$work/rsa"
   for rsa in "$(cat "$work/rsa.pub")" "$(cut -d' ' -f2 "$work/rsa.pub")" "$(cut -d' ' -f2 "$work/k.pub")"; do
     cert=$("$lend_ssh" grant -t 4h "$rsa" dave@hosta 2>/dev/null)
-    if [[ $cert == ssh-*-cert-v01@openssh.com\ * ]] && ssh-keygen -L -f - <<<"$cert" | grep -q 'dave@hosta'; then
+    if [[ $cert == ssh-*-cert-v01@openssh.com\ * ]] && ssh-keygen -L -f - <<<"$cert" | grep 'dave@hosta' >/dev/null; then
       ok "grant a public key given as '${rsa:0:20}...' to stdout"
     else
       not_ok "grant a public key given as '${rsa:0:20}...' to stdout" "$cert"
@@ -322,7 +322,7 @@ test_grant() {
     "$lend_ssh" grant -t 4h AAAAzzzz dave@hosta
 
   cert=$("$lend_ssh" grant -t 4h - dave@hosta <"$work/k.pub" 2>/dev/null)
-  if [[ $cert == ssh-ed25519-cert-v01@openssh.com\ * ]] && ssh-keygen -L -f - <<<"$cert" | grep -q 'Signing CA'; then
+  if [[ $cert == ssh-ed25519-cert-v01@openssh.com\ * ]] && ssh-keygen -L -f - <<<"$cert" | grep 'Signing CA' >/dev/null; then
     ok "grant - reads stdin and writes the certificate to stdout"
   else
     not_ok "grant - reads stdin and writes the certificate to stdout" "$cert"
@@ -1118,7 +1118,7 @@ test_completion() {
   if ! command -v python3 >/dev/null; then
     skip=$((skip + 1)); echo "skip tab completion in a shell (needs python3)"; return
   fi
-  local dir=$work/complete sh how got want f bash_completion=''
+  local dir=$work/complete sh how got want want_sh f bash_completion=''
   local -a files=()
   mkdir -p "$dir/bin" "$dir/cwd" "$dir/site-functions" "$dir/bash-completion/completions"
   ln -s "$lend_ssh" "$dir/bin/lend-ssh"
@@ -1159,10 +1159,14 @@ test_completion() {
     fi
     got=$(cd "$dir/cwd" && PATH=$dir/bin:$PATH "$root/test/tab-complete.py" ${files[@]+"${files[@]}"} \
       "$sh" "${lines[@]}" 2>&1)
-    if [[ $got == "$want" ]]; then
+    # bash 3 has no compopt, so it completes file names whenever nothing else
+    # matches.
+    want_sh=$want
+    [[ $sh != bash ]] || bash -c '((BASH_VERSINFO[0] >= 4))' || want_sh=${want//$' ag\n'/$' agentkey.pub\n'}
+    if [[ $got == "$want_sh" ]]; then
       ok "tab completion in $how"
     else
-      not_ok "tab completion in $how" "$(diff <(echo "$want") <(echo "$got"))"
+      not_ok "tab completion in $how" "$(diff <(echo "$want_sh") <(echo "$got"))"
     fi
   done
   if command -v zsh >/dev/null; then
@@ -1466,7 +1470,7 @@ test_deadline() {
   make_ca
   keygen "$work/dl-agent"
   keygen "$work/dl-loose"
-  if timeout --version 2>/dev/null | grep -q GNU; then
+  if timeout --version 2>/dev/null | grep GNU >/dev/null; then
     deadline_tests 'GNU timeout' '' $((port + 1))
   else
     skip=$((skip + 1)); echo "skip deadline (GNU timeout): none here"
