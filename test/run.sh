@@ -645,10 +645,15 @@ test_agents() {
     "$lend_ssh" agent add claude "$key"
   expect "agent add -f replaces it" 0 'added agent claude' "$lend_ssh" agent add -f claude "$key"
   expect "agent add --force too" 0 'added agent claude' "$lend_ssh" agent add --force claude "$key"
+  ssh-keygen -q -t ed25519 -N secret -C locked -f "$work/locked"
+  expect "agent add warns of a key with a passphrase" 0 \
+    "^lend-ssh: the private key for $work/locked.pub has a passphrase, so the agent can use it only through an ssh-agent added agent locked: $work/locked.pub \$" \
+    bash -c '"$1" agent add locked "$2" 2>&1 | tr "\n" " "' _ "$lend_ssh" "$work/locked"
+  "$lend_ssh" agent rm locked >/dev/null
   expect "agent add rejects a bad name" 2 "'a/b' can't be an agent's name" "$lend_ssh" agent add a/b "$key"
   expect "... and one starting with -" 2 "'-x' can't be an agent's name" "$lend_ssh" agent add -- -x "$key"
   expect "... or with a ." 2 "'a.b' can't be an agent's name" "$lend_ssh" agent add a.b "$key"
-  expect "agent add rejects a bad key" 1 "'nope' is neither a key file, a public key nor a host ssh knows; for a new key, give a path with a /, such as ./nope" \
+  expect "agent add rejects a bad key" 1 "'nope' is neither a key file, a public key nor a host ssh knows; for a host, give nope:, and for a new key, a path with a /, such as ./nope" \
     "$lend_ssh" agent add x nope
   expect "agent add takes a name and a key" 2 'takes a NAME and a KEY' "$lend_ssh" agent add claude
 
@@ -656,9 +661,11 @@ test_agents() {
   expect "agent add creates no key where the directory's parent is missing" 1 "no directory $work/newhome to create a key in" \
     "$lend_ssh" agent add fresh "$new.pub"
   check "... none" test ! -e "$work/newhome"
-  expect "agent add creates no key beside other keys" 1 "${key%/*} already has id_ed25519.pub; name that key" \
+  expect "agent add creates no key beside other keys" 1 "${key%/*} already has id_ed25519.pub; to use it: 'lend-ssh agent add fresh ${key%/*}/id_ed25519.pub', or create a new key there with ssh-keygen$" \
     "$lend_ssh" agent add fresh "${key%/*}/id_typo.pub"
   check "... none" test ! -e "${key%/*}/id_typo"
+  expect "... giving -f back" 1 "to use it: 'lend-ssh agent add -f fresh ${key%/*}/id_ed25519.pub'" \
+    "$lend_ssh" agent add -f fresh "${key%/*}/id_typo.pub"
   mkdir "$work/newhome"
   expect "agent add creates a key that isn't there" 0 \
     "^created a key at $new, without a passphrase$" "$lend_ssh" agent add fresh "$new.pub"
@@ -873,7 +880,7 @@ test_locations() {
     bash -c '"$1" agent add x "docker-volume://novol/.ssh/id_ed25519.pub" 2>&1 | tr "\n" " "; exit "${PIPESTATUS[0]}"' _ "$lend_ssh"
   check "... creating none" test ! -e "$fd/volumes/novol"
   expect "agent add creates no key beside other keys there" 1 \
-    "docker://box/~/.ssh already has id_ed25519.pub; name that key" \
+    "docker://box/~/.ssh already has id_ed25519.pub; to use it: 'lend-ssh agent add x docker://box/~/.ssh/id_ed25519.pub'," \
     "$lend_ssh" agent add x 'docker://box/~/.ssh/id_typo.pub'
   expect "... or where the directory's parent is missing" 1 "no directory docker://box/~/new to create a key in" \
     "$lend_ssh" agent add x 'docker://box/~/new/.ssh/id_ed25519.pub'
@@ -899,6 +906,7 @@ test_locations() {
 # agent add [USER@]HOST, for a host in ~/.ssh/config or known_hosts, through
 # a fake ssh that runs the script here, in a HOME of its own, and whose ssh -G
 # reads a config of the test's.
+# shellcheck disable=SC2016  # bash -c scripts take their own arguments
 test_known_hosts() {
   local bin=$work/bin s=$work/sshhome/.ssh
   mkdir -p "$bin" "$s" "$HOME/.ssh"
@@ -931,11 +939,49 @@ test_known_hosts() {
   expect "agent add a host ssh doesn't know" 1 \
     "'unknown.example' is neither a key file, a public key nor a host ssh knows" \
     "$lend_ssh" agent add x unknown.example
-  expect "... nor at another port" 1 "'other@hashed.example:22' is neither a key file" \
-    "$lend_ssh" agent add x other@hashed.example:22
   touch "$work/hashed.example"
   expect "a file comes before a host" 1 "no public key at hashed.example or hashed.example.pub" \
     "$lend_ssh" agent add x hashed.example
+
+  ssh-keygen -q -t rsa -b 2048 -N '' -C rsa -f "$s/id_rsa"
+  expect "agent add HOST takes ~/.ssh/id_ed25519.pub before id_rsa.pub" 0 \
+    '^added agent d: ssh://aliased/~/.ssh/id_ed25519.pub$' "$lend_ssh" agent add d aliased
+  mv "$s/id_ed25519" "$s/id_ed25519.pub" "$work"
+  expect "... else id_rsa.pub" 0 '^added agent r: ssh://aliased/~/.ssh/id_rsa.pub$' \
+    "$lend_ssh" agent add r aliased
+  expect "agent add HOST: for a host ssh doesn't know" 0 '^added agent h: ssh://unknown.example/~/.ssh/id_rsa.pub$' \
+    "$lend_ssh" agent add h unknown.example:
+  expect "... which ssh logs in to" 0 '^ssh -- unknown.example sh -s$' tail -1 "$work/ssh.log"
+  expect "agent add USER@HOST:PATH, in the home directory" 0 \
+    '^added agent hp: ssh://dave@unknown.example/~/.ssh/id_rsa.pub$' \
+    "$lend_ssh" agent add hp dave@unknown.example:.ssh/id_rsa
+  expect "... with ~/" 0 '^added agent ht: ssh://unknown.example/~/.ssh/id_rsa.pub$' \
+    "$lend_ssh" agent add ht 'unknown.example:~/.ssh/id_rsa.pub'
+  expect "... and from /" 0 "^added agent ha: ssh://unknown.example$s/id_rsa.pub$" \
+    "$lend_ssh" agent add ha "unknown.example:$s/id_rsa.pub"
+  expect "agent add HOST:PORT" 1 \
+    "'unknown.example:22' is HOST:PATH, with PATH a file in the home directory there; for a port, give ssh://unknown.example:22/PATH" \
+    "$lend_ssh" agent add x unknown.example:22
+  rm "$s/id_rsa.pub"
+  expect "agent add HOST: won't replace a default key whose .pub is missing" 1 \
+    '^lend-ssh: no public key at ssh://unknown.example/~/.ssh/id_rsa.pub$' "$lend_ssh" agent add x unknown.example:
+  rm "$s/id_rsa"
+  keygen "$s/work"
+  expect "agent add HOST: creates no key beside another" 1 \
+    "^lend-ssh: ssh://unknown.example/~/.ssh already has work.pub; to use it: 'lend-ssh agent add x unknown.example:.ssh/work.pub', or create a new key there with ssh-keygen$" \
+    "$lend_ssh" agent add x unknown.example:
+  ssh-keygen -q -t ecdsa -N secret -C locked -f "$s/id_ecdsa"
+  expect "agent add warns of a key with a passphrase there" 0 \
+    '^lend-ssh: the private key for ssh://unknown.example/~/.ssh/id_ecdsa.pub has a passphrase, so the agent can use it only through an ssh-agent added agent e: ssh://unknown.example/~/.ssh/id_ecdsa.pub $' \
+    bash -c '"$1" agent add e unknown.example: 2>&1 | tr "\n" " "' _ "$lend_ssh"
+  rm "$s"/id_ecdsa* "$s"/work*
+  expect "agent add HOST: creates ~/.ssh/id_ed25519" 0 \
+    '^created a key at ssh://unknown.example/~/.ssh/id_ed25519, without a passphrase$' \
+    "$lend_ssh" agent add n unknown.example:
+  printf '#!/bin/sh\ncat >/dev/null\necho "x[\\$(touch %s)] -"\necho ssh-ed25519 AAAA\n' "$work/ran" >"$bin/ssh"
+  expect "agent add takes no command from the location" 1 "couldn't read ssh://unknown.example/~/.ssh/id_ed25519.pub" \
+    "$lend_ssh" agent add x unknown.example:
+  check "... running none" test ! -e "$work/ran"
 }
 
 # grant with the signing key in an ssh-agent and not on disk.
@@ -1091,6 +1137,11 @@ test_completion() {
   completes '//box/~/.ssh/id_ed25519.pub' agent add claude docker : //
   completes '//box/~/.ssh/id_ed25519.pub' agent add claude docker :
   completes files agent add claude c
+  completes 'gw' agent add claude g
+  completes 'ann@gw' agent add claude ann@g
+  completes 'myhost' agent add claude my
+  completes '' agent add claude gw :
+  completes files agent add claude '~'
   touch "$work/docs"
   completes files agent add claude d
   completes '' agent add claude key ''

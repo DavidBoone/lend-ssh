@@ -123,7 +123,7 @@ real_ssh_path_and_port() {
 real_ssh_refusals() {
   make_ca
   box_as_agent 'mkdir ~/others && ssh-keygen -q -t ed25519 -N "" -C x -f ~/others/x && rm ~/others/x && mkdir ~/lone && ssh-keygen -q -t ed25519 -N "" -C x -f ~/lone/x && rm ~/lone/x.pub'
-  expect "ssh: agent add refuses a new key beside other keys" 1 'others already has x.pub; name that key' \
+  expect "ssh: agent add refuses a new key beside other keys" 1 "others already has x.pub; to use it: 'lend-ssh agent add box agent@agentbox:others/x.pub'" \
     "$lend_ssh" agent add box ssh://agent@agentbox/~/others/id_ed25519.pub
   expect "... and leaves only the other key there" 0 '^x.pub$' box_exec ls /home/agent/others
   expect "ssh: agent add refuses a new key with no parent directory" 1 'no directory ssh://agent@agentbox/~/no to create a key in' \
@@ -174,6 +174,28 @@ real_ssh_bare_host() {
   "$lend_ssh" account rm dave@host1 >/dev/null
   if [[ -e $work/config.ssh ]]; then cp -p "$work/config.ssh" "$HOME/.ssh/config"; else rm -f "$HOME/.ssh/config"; fi
   [[ -n $had ]] || box_exec rm -f /home/agent/.ssh/id_ed25519 /home/agent/.ssh/id_ed25519.pub
+}
+
+# [USER@]HOST: and [USER@]HOST:PATH: the agent's existing ~/.ssh/id_rsa, which
+# its ssh then uses with the certificate beside it, and a key with a
+# passphrase. The keys already in ~/.ssh there are set aside meanwhile.
+# shellcheck disable=SC2016  # the scripts expand their own variables
+real_ssh_host_path() {
+  make_ca
+  box_as_agent 'mkdir -p ~/.ssh ~/aside ~/pp && for f in ~/.ssh/id_*; do [ ! -e "$f" ] || mv "$f" ~/aside/; done &&
+    ssh-keygen -q -t rsa -b 2048 -N "" -C rsa -f ~/.ssh/id_rsa && ssh-keygen -q -t ed25519 -N secret -C pp -f ~/pp/id_ed25519'
+  expect "ssh: agent add HOST: takes the agent's id_rsa" 0 '^added agent box: ssh://agent@agentbox/~/.ssh/id_rsa.pub$' \
+    "$lend_ssh" agent add box agent@agentbox:
+  "$lend_ssh" account add dave@host1 >/dev/null
+  "$lend_ssh" grant -t 1h box dave@host1 >/dev/null
+  expect "... grant writes id_rsa-cert.pub there" 0 '^agent 644$' box_stat /home/agent/.ssh/id_rsa-cert.pub
+  expect "... which the agent's ssh uses by default" 0 '^dave$' agent_ssh agentbox dave whoami
+  expect "ssh: agent add HOST:PATH warns of a key with a passphrase" 0 \
+    '^lend-ssh: the private key for ssh://agent@agentbox/~/pp/id_ed25519.pub has a passphrase, so the agent can use it only through an ssh-agent added agent pp: ssh://agent@agentbox/~/pp/id_ed25519.pub $' \
+    bash -c '"$1" agent add pp agent@agentbox:pp/id_ed25519 2>&1 | tr "\n" " "' _ "$lend_ssh"
+  "$lend_ssh" agent rm box pp >/dev/null
+  "$lend_ssh" account rm dave@host1 >/dev/null
+  box_as_agent 'rm -rf ~/pp ~/.ssh/id_rsa* && for f in ~/aside/*; do [ ! -e "$f" ] || mv "$f" ~/.ssh/; done && rmdir ~/aside'
 }
 
 # A location lend-ssh can't reach: grant counts the grant as made and grants
