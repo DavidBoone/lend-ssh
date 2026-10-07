@@ -23,6 +23,7 @@ import os
 import pty
 import re
 import select
+import signal
 import sys
 import time
 
@@ -118,5 +119,17 @@ for line in lines:
     wait_for(b"\nRESULT: ")
     print(wait_for(b"\r\n").decode().rstrip())
     wait_for(prompt.encode())
+# The shell's exit waits until its last output is read, on macOS.
 os.write(fd, b"exit\n")
-os.waitpid(pid, 0)
+end = time.time() + 10
+while not os.waitpid(pid, os.WNOHANG)[0]:
+    if time.time() > end:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        sys.exit(f"tab-complete: {shell} didn't exit")
+    r, _, _ = select.select([fd], [], [], 0.1)
+    if r:
+        try:
+            os.read(fd, 65536)
+        except OSError:
+            pass

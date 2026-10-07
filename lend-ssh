@@ -1214,7 +1214,7 @@ cmd_revoke() {
     fi
     rm "$cert.old"
   fi
-  record_revoked "$c_end" "$name" "$(abs_path "$(pubkey_of "$key")")" "${gone[@]}"
+  record_revoked "$c_end" "$name" "$(pubkey_of "$key")" "${gone[@]}"
   {
     printf '%s: revoked %s' "$c_id" "$(printf '%s\n' "${gone[@]%%#*}" | paste -sd, - | sed 's/,/, /g')"
     [[ ${#keep[@]} -eq 0 ]] || printf '; keeps %s%s' "$(printf '%s\n' "${keep[@]%%#*}" | paste -sd, - | sed 's/,/, /g')" "$end"
@@ -1947,7 +1947,8 @@ live_revoked() {
 # public key file KEY, ending END (empty for none), was taken back from these
 # principals, and drops the lines that no longer work.
 record_revoked() {
-  local end=${1:-none} name=${2//[^A-Za-z0-9._@-]/_} key=$3 p
+  local end=${1:-none} name=${2//[^A-Za-z0-9._@-]/_} key p
+  key=$(abs_path "$3")
   shift 3
   name=${name:-agent}
   mkdir -p "$config"
@@ -1991,6 +1992,7 @@ revoked_groups() {
 cert_status() {
   local key=${1%-cert.pub}.pub c_end c_id c_deadline p end name k mine='' rest='' shown='' out
   local -a c_principals c_exts c_crit
+  [[ ! -d ${key%/*} ]] || key=$(abs_path "$key")
   while read -r end p name k; do
     [[ -z $end || $k != "$key" ]] || mine+="$end $p"$'\n'
   done <<<"${2:-}"

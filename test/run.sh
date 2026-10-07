@@ -9,7 +9,7 @@
 set -uo pipefail
 
 root=$(cd "${0%/*}/.." && pwd)
-top=$(mktemp -d)
+top=$(cd "$(mktemp -d)" && pwd -P)
 # The tests run a copy of the clone, which install links to.
 clone=$top/clone
 mkdir -p "$clone"
@@ -390,6 +390,16 @@ test_revoke() {
     '^textual: revoked deploy@hostb; a copy of the certificate' "$lend_ssh" revoke textual
   expect "... on stderr" 0 '^0$' bash -c '"$1" grant -t 1h textual dave@hosta >/dev/null 2>&1; "$1" revoke textual 2>/dev/null | wc -c | tr -d " "' _ "$lend_ssh"
   "$lend_ssh" agent rm textual >/dev/null
+  mv "$HOME/.config" "$work/config"
+  ln -s "$work/config" "$HOME/.config"
+  "$lend_ssh" agent add linked "$(cat "$work/r.pub")" >/dev/null
+  "$lend_ssh" grant -t 1h linked dave@hosta deploy@hostb >/dev/null 2>&1
+  "$lend_ssh" revoke linked dave@hosta >/dev/null 2>&1
+  expect "agent lists a revoked account with its config through a symlink" 0 \
+    '^	deploy@hostb dave@hosta \(revoked\) until ' "$lend_ssh" agent
+  "$lend_ssh" agent rm linked >/dev/null
+  rm "$HOME/.config"
+  mv "$work/config" "$HOME/.config"
   # An agent from older versions holds the public key itself.
   mkdir -p "$HOME/.config/lend-ssh/agents"
   cat "$work/r.pub" >"$HOME/.config/lend-ssh/agents/textual"
@@ -936,7 +946,7 @@ test_ssh_agent() {
   mv "$LEND_SSH_CA" "$work/ca-private"
   expect "grant without the signing key's private key" 1 "signing key isn't at .* or in your ssh-agent" \
     "$lend_ssh" grant -t 4h "$work/a" dave@hosta
-  eval "$(ssh-agent -s)" >/dev/null
+  eval "$(ssh-agent -s -a "/tmp/lend-ssh-test-$$-agent")" >/dev/null
   ssh-add -q "$work/ca-private"
   expect "grant with the signing key in ssh-agent" 0 'dave@hosta \(new\)' "$lend_ssh" grant -t 4h "$work/a" dave@hosta
   check "... by the CA" grep -qF "$(ssh-keygen -lf "$LEND_SSH_CA.pub" | cut -d' ' -f2)" \
