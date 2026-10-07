@@ -103,7 +103,8 @@ of your own, `-O force-command=…`, needs `-D`, since a certificate holds one.
 
 On a host whose sshd runs sftp as `internal-sftp`, the script runs the first
 `sftp-server` program it finds in `/usr/lib/openssh`, `/usr/libexec/openssh`,
-`/usr/libexec` and `/usr/lib/ssh`.
+`/usr/libexec` and `/usr/lib/ssh`, with the arguments `internal-sftp`
+was given.
 
 The deadline doesn't end processes the agent detaches from the session, such
 as one started with `setsid` or `nohup`, and an agent with a shell can kill

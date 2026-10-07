@@ -586,7 +586,7 @@ EOF2
 # principal $3, and prints what it did; fails if ssh did.
 edit_account() {
   local mode=$1 file=$2 i=$3 principal=${4:-}
-  edit_script "$mode" "$file" "$(trust_line "$principal")" | ssh -- "${dests[i]}" sh -s
+  ssh -- "${dests[i]}" sh -s <<<"$(edit_script "$mode" "$file" "$(trust_line "$principal")")"
 }
 
 # Sets file to -k's value, if given.
@@ -801,7 +801,10 @@ loc_sh() {
   fi
 }
 
-# Runs the sh script on stdin at the location parse_location read.
+# Runs the sh script on stdin at the location parse_location read. Callers
+# give the script as a here-string, not through a pipe: when ssh or docker
+# exits without reading it and SIGPIPE is ignored, a writer into the pipe
+# prints a write error.
 at_location() {
   local -a ssh_args=()
   case $loc_kind in
@@ -895,9 +898,9 @@ send_cert() {
   parse_location "$1"
   cert=$(loc_sh "${loc_path%.pub}-cert.pub")
   if [[ -n ${2:-} ]]; then
-    put_script "$cert" "$2" | at_location
+    at_location <<<"$(put_script "$cert" "$2")"
   else
-    printf 'rm -f %s\n' "$cert" | at_location
+    at_location <<<"rm -f $cert"
   fi
 }
 
@@ -1800,7 +1803,8 @@ cmd_complete() {
 # key as $2 and the certificate's principals after them. It refuses the
 # session after the deadline, and otherwise runs what was asked for (the
 # login shell, a command, or sftp, whose internal-sftp it can only run as an
-# sftp-server program) and at the deadline sends it SIGHUP, and SIGKILL 10
+# sftp-server program, with internal-sftp's arguments, which some sshds pass
+# as "internal-sftp " even when there are none) and at the deadline sends it SIGHUP, and SIGKILL 10
 # seconds later: with GNU timeout, else with perl. A session with no terminal
 # gets the signals as a process group. While ~/.ssh/authorized_keys trusts
 # the CA under one of the principals, a watcher checks it every 10 seconds
@@ -1834,11 +1838,15 @@ if trusted; then
   ) </dev/null >/dev/null 2>&1 &
 fi
 c=${SSH_ORIGINAL_COMMAND-}
-if [ "$c" = internal-sftp ]; then
-  for c in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/libexec/sftp-server /usr/lib/ssh/sftp-server; do
-    [ -x "$c" ] && break
-  done
-fi
+case $c in
+  internal-sftp | "internal-sftp "*)
+    a=${c#internal-sftp}
+    for c in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/libexec/sftp-server /usr/lib/ssh/sftp-server; do
+      [ -x "$c" ] && break
+    done
+    c=$c$a
+    ;;
+esac
 if [ -n "$c" ]; then set -- "$SHELL" -c "$c"; else set -- "$SHELL" -l; fi
 group=1
 [ -t 0 ] && group=0
@@ -2062,7 +2070,7 @@ add_at_location() {
   if [[ $loc_path == *.pub ]]; then pub=$loc_path; else pub=$loc_path.pub; fi
   priv=${pub%.pub}
   to=${loc%"$loc_path"}$pub
-  probe_script "$(loc_sh "$pub")" "$(loc_sh "$priv")" | at_location >"$tmp/key.pub" || status=$?
+  at_location <<<"$(probe_script "$(loc_sh "$pub")" "$(loc_sh "$priv")")" >"$tmp/key.pub" || status=$?
   case $status in
     0)
       ssh-keygen -l -f "$tmp/key.pub" >/dev/null 2>&1 || die "$to isn't a public key"
@@ -2078,7 +2086,7 @@ add_at_location() {
   ssh-keygen -q -t ed25519 -N '' -C "$name@lend-ssh" -f "$tmp/key" </dev/null
   dir=${to%/*}
   status=0
-  out=$(put_script "$(loc_sh "$priv")" "$tmp/key" "$(loc_sh "$pub")" "$tmp/key.pub" | at_location) || status=$?
+  out=$(at_location <<<"$(put_script "$(loc_sh "$priv")" "$tmp/key" "$(loc_sh "$pub")" "$tmp/key.pub")") || status=$?
   case $status in
     0) ;;
     75) die "no directory ${dir%/*} to create a key in" ;;
