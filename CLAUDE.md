@@ -10,7 +10,8 @@ compares it with other tools.
 `./lend-ssh help` lists the commands and `./lend-ssh COMMAND -h` shows one;
 use those names in code, docs, tests and conversation. Every option has a
 short and a long form; `-f`/`--force` always means force, and a file option
-is `-k`/`--file FILE`. Usage errors exit 2, other errors 1.
+is `-k`/`--file FILE`. Options go before the command or anywhere after it,
+until `--`. Usage errors exit 2, other errors 1.
 
 ## Layout
 

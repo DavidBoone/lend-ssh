@@ -453,7 +453,9 @@ options:
 ```
 
 `lend-ssh COMMAND -h` explains a command and its options. Each option has a
-short and a long form, such as `-t` and `--time`.
+short and a long form, such as `-t` and `--time`, and can go before the
+command or anywhere after it, as in `lend-ssh grant claude box -t 4h`; `--`
+ends them.
 
 lend-ssh keeps its signing key, agents and accounts in `~/.config/lend-ssh`
 (or `$XDG_CONFIG_HOME/lend-ssh`); `LEND_SSH_CA` sets another path for the

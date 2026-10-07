@@ -292,62 +292,78 @@ option_spec() {
   return 1
 }
 
-# Reads the words $2... as command $1's options take them: options, until --
-# or the first other word, then arguments. Sets opts to the options given,
-# each by its first flag followed by its value (empty for one that takes
-# none), and args to the arguments.
+# Reads option word $2, and its value from $3 when it takes one that $2
+# doesn't hold, as page_options' lines $1 take it. Adds each flag in it to
+# opts, by its option's first flag followed by its value (empty for one that
+# takes none), and sets used to the number of words it took: 1 or 2.
+read_option() {
+  local table=$1 word=$2 flag spec value
+  used=1
+  if [[ $word == --* ]]; then
+    flag=${word%%=*}
+    spec=$(option_spec "$flag" "$table") || usage_error "unknown option $flag"
+    if [[ -z ${spec#*|} ]]; then
+      [[ $word != *=* ]] || usage_error "$flag takes no value"
+      value=''
+    elif [[ $word == *=* ]]; then
+      value=${word#*=}
+    else
+      (($# > 2)) || usage_error "$flag needs a value"
+      value=$3
+      used=2
+    fi
+    opts+=("${spec%%|*}" "$value")
+    return 0
+  fi
+  word=${word#-}
+  while [[ -n $word ]]; do
+    flag=-${word:0:1}
+    word=${word:1}
+    spec=$(option_spec "$flag" "$table") || usage_error "unknown option $flag"
+    if [[ -z ${spec#*|} ]]; then
+      value=''
+    elif [[ -n $word ]]; then
+      value=$word
+      word=''
+    else
+      (($# > 2)) || usage_error "$flag needs a value"
+      value=$3
+      used=2
+    fi
+    opts+=("${spec%%|*}" "$value")
+  done
+}
+
+# Reads the words $2... as command $1's options take them: options anywhere
+# before --, and arguments. Sets opts to the options given (as read_option
+# adds them) and args to the arguments, in order.
 parse_options() {
-  local table word flag spec value
+  local table used
   table=$(page_options "$1")
   shift
   opts=() args=()
   while (($#)); do
-    word=$1
-    case $word in
+    case $1 in
       --)
         shift
+        args+=("$@")
         break
         ;;
-      --*)
-        shift
-        flag=${word%%=*}
-        spec=$(option_spec "$flag" "$table") || usage_error "unknown option $flag"
-        if [[ -z ${spec#*|} ]]; then
-          [[ $word != *=* ]] || usage_error "$flag takes no value"
-          value=''
-        elif [[ $word == *=* ]]; then
-          value=${word#*=}
-        else
-          (($#)) || usage_error "$flag needs a value"
-          value=$1
-          shift
-        fi
-        opts+=("${spec%%|*}" "$value")
-        ;;
       -?*)
-        shift
-        word=${word#-}
-        while [[ -n $word ]]; do
-          flag=-${word:0:1}
-          word=${word:1}
-          spec=$(option_spec "$flag" "$table") || usage_error "unknown option $flag"
-          if [[ -z ${spec#*|} ]]; then
-            value=''
-          elif [[ -n $word ]]; then
-            value=$word
-            word=''
-          else
-            (($#)) || usage_error "$flag needs a value"
-            value=$1
-            shift
-          fi
-          opts+=("${spec%%|*}" "$value")
-        done
+        read_option "$table" "$@"
+        shift "$used"
         ;;
-      *) break ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
     esac
   done
-  args=("$@")
+}
+
+# Prints every command's options as page_options prints one's.
+all_options() {
+  cut -d'|' -f2- <<<"$option_table"
 }
 
 # Prints the value given to option $1 (by its first flag), the last one if
@@ -1742,8 +1758,8 @@ agent_names() {
 # and from the hosts in ~/.ssh/config and ~/.ssh/known_hosts for account add
 # and account rm.
 cmd_complete() {
-  local cur cmd page word want='' positional=0 opts_done='' given='' strip='' table spec glue='' first=''
-  local -a words=()
+  local cur cmd page word want='' positional=0 opts_done='' given='' strip='' table spec glue='' first='' helping=''
+  local -a words=() lead=()
   # bash splits dave@host into dave, @ and host, and --id=x and a:b alike;
   # this joins them back up.
   for word in "$@"; do
@@ -1763,14 +1779,47 @@ cmd_complete() {
     strip=${strip%@}
     [[ ${!#} != : ]] || strip=$cur
   fi
+  # The options before the command, which the parser reads as the command's.
+  table=$(all_options)
+  while ((${#words[@]} > 1)) && [[ -z $opts_done && ${words[0]} == -?* ]]; do
+    word=${words[0]}
+    words=("${words[@]:1}")
+    lead+=("$word")
+    case $word in
+      --) opts_done=1 ;;
+      -h | --help) helping=1 ;;
+      *)
+        want=$(wanted_value "$word" "$table")
+        if [[ -n $want ]] && ((${#words[@]} > 1)); then
+          lead+=("${words[0]}")
+          words=("${words[@]:1}")
+          want=''
+        fi
+        ;;
+    esac
+  done
   if ((${#words[@]} == 1)); then
-    if [[ $cur == -* ]]; then offer_options ''; else offer_commands ''; fi
+    if [[ -n $want ]]; then
+      offer_values "$want" ''
+    elif [[ -z $opts_done && $cur == --*=* ]]; then
+      spec=$(option_spec "${cur%%=*}" "$table") && offer_values "${spec%%|*}" "${cur%%=*}="
+    elif [[ -z $opts_done && $cur == -* ]]; then
+      offer_options ''
+    else
+      offer_commands ''
+    fi
     return 0
   fi
-  cmd=${words[0]}
-  words=("${words[@]:1:${#words[@]}-2}")
+  opts_done=''
+  if [[ -n $helping ]]; then
+    cmd=help
+    words=("${words[@]:0:${#words[@]}-1}")
+  else
+    cmd=${words[0]}
+    words=("${words[@]:1:${#words[@]}-2}")
+  fi
   case $cmd in
-    help | -h | --help)
+    help)
       if ((${#words[@]} == 0)); then
         offer_commands ''
       elif ((${#words[@]} == 1)) && is_noun "${words[0]}"; then
@@ -1789,9 +1838,9 @@ cmd_complete() {
     words=("${words[@]:1}")
   fi
   table=$(page_options "$page")
-  # The words before $cur as parse_options reads them: options until the
-  # first other word, or --.
-  for word in ${words[@]+"${words[@]}"}; do
+  # The words before $cur as parse_options reads them: options anywhere
+  # before --.
+  for word in ${lead[@]+"${lead[@]}"} ${words[@]+"${words[@]}"}; do
     if [[ -n $want ]]; then
       want=''
     elif [[ -z $opts_done && $word == -- ]]; then
@@ -1800,7 +1849,6 @@ cmd_complete() {
       want=$(wanted_value "$word" "$table")
       [[ -n $want ]] || given+=" $(option_flags "$word" "$table")"
     else
-      opts_done=1
       ((positional)) || first=$word
       positional=$((positional + 1))
       given+=" $word"
@@ -2371,38 +2419,72 @@ cmd_agent_show() {
     { print }'
 }
 
-[[ $# -gt 0 ]] || { usage >&2; exit 2; }
+if [[ ${1:-} == __complete ]]; then
+  shift
+  cmd_complete "$@"
+  exit
+fi
+help_key=''
+# The options before the command, checked against every command's here, are
+# read as the command's after it.
+lead=()
+opts=()
+table=$(all_options)
+while (($#)) && [[ $1 == -?* ]]; do
+  if [[ $1 == -- ]]; then
+    lead+=(--)
+    shift
+    break
+  fi
+  read_option "$table" "$@"
+  lead+=("${@:1:used}")
+  shift "$used"
+done
+if ((!$#)); then
+  for arg in ${lead[@]+"${lead[@]}"}; do
+    if [[ $arg == -h || $arg == --help ]]; then
+      usage
+      exit 0
+    fi
+  done
+  usage >&2
+  exit 2
+fi
 cmd=$1
 shift
-help_key=''
-case $cmd in
-  __complete)
-    cmd_complete "$@"
-    exit
-    ;;
-  help | -h | --help)
-    # -h or --help after help asks for help's own page, or COMMAND's.
-    words=()
-    for arg in "$@"; do
-      [[ $arg == -h || $arg == --help ]] || words+=("$arg")
-    done
-    if [[ ${#words[@]} -gt 0 ]]; then
-      command_help "${words[*]}"
-    elif [[ $# -gt 0 && $cmd == help ]]; then
-      command_help help
-    else
-      usage
+if [[ $cmd == help ]]; then
+  # -h or --help with help asks for help's own page, or COMMAND's.
+  words=()
+  asked=''
+  ended=''
+  for arg in ${lead[@]+"${lead[@]}"} "$@"; do
+    if [[ -n $ended ]]; then
+      words+=("$arg")
+      continue
     fi
-    exit 0
-    ;;
-  -*) usage_error "unknown option $cmd" ;;
-esac
+    case $arg in
+      -h | --help) asked=1 ;;
+      --) ended=1 ;;
+      -?*) usage_error "unknown option $arg" ;;
+      *) words+=("$arg") ;;
+    esac
+  done
+  if [[ ${#words[@]} -gt 0 ]]; then
+    command_help "${words[*]}"
+  elif [[ -n $asked ]]; then
+    command_help help
+  else
+    usage
+  fi
+  exit 0
+fi
 [[ $cmd =~ ^[a-z]+$ && -n $(command_lines "$cmd") ]] || usage_error "unknown command '$cmd'"
 help_key=$cmd
 if is_noun "$cmd" && [[ ${1:-} =~ ^[a-z]+$ && -n $(command_lines "$cmd $1") ]]; then
   help_key="$cmd $1"
   shift
 fi
+set -- ${lead[@]+"${lead[@]}"} "$@"
 for arg in "$@"; do
   [[ $arg == -- ]] && break
   if [[ $arg == -h || $arg == --help ]]; then

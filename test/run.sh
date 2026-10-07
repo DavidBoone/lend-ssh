@@ -91,7 +91,20 @@ test_cli() {
   expect "a long option's missing value" 2 '--time needs a value' "$lend_ssh" grant --time
   expect "a long option that takes no value" 2 '--force takes no value' "$lend_ssh" install --force=yes
   expect "an unknown option in a bundle" 2 'unknown option -x' "$lend_ssh" account add -px dave@a
-  expect "an option after the arguments is one" 2 "'-p' isn't \[USER@\]HOST" "$lend_ssh" account add dave@a -p
+  expect "an option after the arguments is one" 1 "no signing key" "$lend_ssh" grant x dave@a -t 4h
+  expect "... and between them" 1 "no signing key" "$lend_ssh" grant x -t4h dave@a
+  expect "... and before the command" 1 "no signing key" "$lend_ssh" -t 4h grant x dave@a
+  expect "... and before a noun" 1 "no signing key" "$lend_ssh" -p account add dave@a
+  expect "... checked against the command's" 2 "unknown option -p \(see 'lend-ssh account rm -h'\)" \
+    "$lend_ssh" -p account rm dave@a
+  expect "... and against every command's before it" 2 "unknown option -x \(see 'lend-ssh help'\)" \
+    "$lend_ssh" -x grant
+  expect "... with its value read before the command" 2 "-t needs a value \(see 'lend-ssh grant -h'\)" \
+    "$lend_ssh" grant x dave@a -t
+  expect "-- ends the options" 2 "'-p' isn't \[USER@\]HOST" "$lend_ssh" account add dave@a -- -p
+  expect "... before the command too" 2 "grant needs -t TIME" "$lend_ssh" -- grant x dave@a -t 4h
+  expect "help takes no other options" 2 "unknown option -f \(see 'lend-ssh help'\)" "$lend_ssh" help -f
+  expect "... and reads none after --" 2 "no command '-h'" "$lend_ssh" help -- -h
 }
 
 # shellcheck disable=SC2016  # bash -c scripts take their own arguments
@@ -1066,7 +1079,28 @@ test_completion() {
   completes '10.0.0.1 box build gw myhost' account add -pk x ''
   completes '10.0.0.1 box build gw myhost' account add --file x ''
   completes '10.0.0.1 box build gw myhost' account add --file=x ''
-  completes '' account add a@box -
+  completes '-p --print -k --file' account add a@box -
+  completes '-k --file' account add a@box -p -
+  completes '' account add a@box -- -
+  completes 'build' account add box -- b
+  completes '' account add a@box -k ''
+  completes "$commands" -t 4h ''
+  completes 'grant' -t 4h g
+  completes '-h --help' -t 4h -
+  completes '' -t ''
+  completes 'permit-agent-forwarding' -O permit-a
+  completes '--option=permit-agent-forwarding' --option=permit-a
+  completes 'permit-agent-forwarding' --option = permit-a
+  completes 'codex' -t 4h grant co
+  completes 'codex' -I me grant -t 4h co
+  completes '-t --time -O --option -I --id -D --no-deadline' -t 4h grant -
+  completes 'add reset rm' -k x account ''
+  completes '-p --print -k --file' -k x account add -
+  completes '-k --file' -p account add -
+  completes "$commands" -h ''
+  completes 'add show rm' -h agent ''
+  completes '' -h grant ''
+  completes "$commands" -- ''
   completes '' account add da
   completes '10.0.0.1 box build gw myhost' account add ''
   completes 'box build' account rm b
@@ -1094,6 +1128,10 @@ test_completion() {
   completes 'codex' grant -D -t 4h co
   completes 'codex' grant --time 4h --id=me co
   completes 'codex' grant -Dt4h co
+  completes '-t --time -O --option -I --id -D --no-deadline' grant claude -
+  completes '-t --time -O --option -I --id' grant claude box -D -t 4h -
+  completes 'build ann@gw ann@myhost' grant claude -t 4h box ''
+  completes 'ann@gw ann@myhost' grant claude -O permit-user-rc box a
   completes '' grant x
   completes files grant ./
   completes files grant ~/
@@ -1186,14 +1224,16 @@ test_completion() {
     'lend-ssh grant --no-d' 'lend-ssh grant ag' 'lend-ssh grant ./ag' 'lend-ssh grant cl'
     'lend-ssh grant agentkey.pub ann@my' 'lend-ssh agent show agentkey.pub ag' 'lend-ssh agent rm co'
     'lend-ssh agent add x ag' 'lend-ssh agent add x docker:' 'lend-ssh agent add x ssh://bo'
-    'lend-ssh account res' 'lend-ssh help acc' 'lend-ssh help agent sh')
+    'lend-ssh account res' 'lend-ssh help acc' 'lend-ssh help agent sh'
+    'lend-ssh -t 4h grant co' 'lend-ssh grant codex -t 4h ann@my')
   want=$(printf '%s\n' 'lend-ssh grant' 'lend-ssh account add dave@box' 'lend-ssh account add build' \
     'lend-ssh account add ag' 'lend-ssh grant -O permit-agent-forwarding' \
     'lend-ssh grant --option=permit-agent-forwarding' 'lend-ssh grant --no-deadline' 'lend-ssh grant ag' \
     'lend-ssh grant ./agentkey.pub' 'lend-ssh grant claude' 'lend-ssh grant agentkey.pub ann@myhost' \
     'lend-ssh agent show agentkey.pub ag' 'lend-ssh agent rm codex' 'lend-ssh agent add x agentkey.pub' \
     'lend-ssh agent add x docker://box/~/.ssh/id_ed25519.pub' 'lend-ssh agent add x ssh://box/~/.ssh/id_ed25519.pub' \
-    'lend-ssh account reset' 'lend-ssh help account' 'lend-ssh help agent show')
+    'lend-ssh account reset' 'lend-ssh help account' 'lend-ssh help agent show' \
+    'lend-ssh -t 4h grant codex' 'lend-ssh grant codex -t 4h ann@myhost')
   for how in 'bash eval' 'zsh eval' 'zsh files' 'bash files'; do
     sh=${how%% *}
     files=()
