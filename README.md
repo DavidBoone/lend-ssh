@@ -90,10 +90,16 @@ asks for a passphrase for it.
 
 With a FIDO2 security key, such as a YubiKey, `lend-ssh init -s` keeps the
 signing key on it instead. `ca` is then only a handle to the key, useless
-without the security key, and each `grant` and `revoke` asks you to touch it,
-so nothing can sign a certificate without you there. Keep a copy of `ca`: the
-security key alone can't sign without it. It needs OpenSSH 8.2 or later and a
-security key that does ed25519, as most do. Hosts need nothing new.
+without the security key, and each `grant` and `revoke` asks for the security
+key's PIN and a touch. A touch alone isn't enough: something running as you
+could start signing just as you grant, when you'd expect to touch the key.
+Keep a copy of `ca`: the security key alone can't sign without it.
+
+`init -s` needs OpenSSH 8.4 or later here and a security key that does
+ed25519, as most do, with a FIDO2 PIN set (`ykman fido access change-pin` for
+a YubiKey). Hosts need OpenSSH 8.2 or later, and an sshd that doesn't leave
+`sk-ssh-ed25519@openssh.com` out of `CASignatureAlgorithms`; `account add`
+warns when it sees otherwise.
 
 **2. Set up each account** agents may use:
 

@@ -80,9 +80,10 @@ Creates the signing key, $(tildify "$ca") (set LEND_SSH_CA for another
 path), asking for a passphrase. Load it into your ssh-agent with ssh-add to
 stop typing the passphrase for each grant.
 
-With -s, the key lives on a FIDO2 security key instead: $(tildify "$ca") is
-then only a handle to it, so keep a copy of it with the key. Each grant and
-revoke asks you to touch the security key, and there's no passphrase.
+With -s, the key lives on a FIDO2 security key instead, which needs a PIN
+set: $(tildify "$ca") is then only a handle to it, so keep a copy of it.
+Each grant and revoke asks for the security key's PIN and a touch, and
+there's no passphrase.
 EOF2
       ;;
     'account add')
@@ -565,11 +566,14 @@ cmd_init() {
   mkdir -p "${ca%/*}"
   chmod 700 "${ca%/*}"
   if [[ $type == ed25519-sk ]]; then
-    # A security key has no passphrase to ask for; a touch guards it.
-    ssh-keygen -q -t "$type" -N '' -C "lend-ssh CA ${USER:-$(id -un)}@$(hostname)" -f "$ca" ||
-      die "couldn't create a key on the security key; is one plugged in, and does it do ed25519-sk?"
+    # The handle needs no passphrase: the security key's PIN and a touch guard
+    # each signature. A touch alone could be had by anything running as you
+    # that starts signing as you grant, since you'd expect to touch it then.
+    ssh-keygen -q -t "$type" -O verify-required -N '' \
+      -C "lend-ssh CA ${USER:-$(id -un)}@$(hostname)" -f "$ca" ||
+      die "couldn't create a key on the security key; is one plugged in, does it have a PIN (ykman fido access change-pin), and does it do ed25519-sk?"
     echo "Created $ca, a handle to the key on your security key; keep a copy of it."
-    echo "Each grant and revoke will ask you to touch the security key."
+    echo "Each grant and revoke will ask for the security key's PIN and a touch."
   else
     ssh-keygen -q -t "$type" -C "lend-ssh CA ${USER:-$(id -un)}@$(hostname)" -f "$ca"
     echo "Created $ca."
@@ -596,6 +600,30 @@ line='$line'
 tmp="\$f.lend-ssh.\$\$"
 trap 'rm -f "\$tmp"' EXIT
 EOF2
+  # A security key's CA needs OpenSSH 8.2 on the host, and an sshd that
+  # accepts its signatures; warn, on stderr, where the host plainly can't.
+  if [[ $mode == add && $(cut -d' ' -f1 "$ca.pub") == sk-* ]]; then
+    cat <<'EOF2'
+v=$(ssh -V 2>&1 | sed -n 's/^OpenSSH_\([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
+if [ -n "$v" ]; then
+  major=${v% *} minor=${v#* }
+  if [ "$major" -lt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -lt 2 ]; }; then
+    echo "warning: this host has OpenSSH $major.$minor, and certificates from a security key need 8.2 or later" >&2
+  fi
+fi
+for c in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf /etc/crypto-policies/back-ends/opensshserver.config; do
+  [ -r "$c" ] || continue
+  a=$(grep -i '^[[:space:]]*CASignatureAlgorithms' "$c" | head -1 | sed 's/^[[:space:]]*[^[:space:]]*[[:space:]=]*//')
+  case $a in
+    '' | +*) ;;
+    -*sk-ssh-ed25519@openssh.com* | -*sk-*\**) echo "warning: $c takes sk-ssh-ed25519@openssh.com out of CASignatureAlgorithms, so sshd here may refuse certificates from a security key" >&2 ;;
+    -*) ;;
+    *sk-ssh-ed25519@openssh.com* | *sk-*\**) ;;
+    *) echo "warning: $c sets CASignatureAlgorithms without sk-ssh-ed25519@openssh.com, so sshd here may refuse certificates from a security key" >&2 ;;
+  esac
+done
+EOF2
+  fi
   if [[ $mode == add ]]; then
     cat <<'EOF2'
 mkdir -p "$(dirname "$f")"
@@ -646,6 +674,8 @@ cmd_account_add() {
     n=$(account_number "${names[i]}")
     ((n > 0)) || n=1
     if [[ -n $print ]]; then
+      [[ $(cut -d' ' -f1 "$ca.pub") != sk-* ]] ||
+        echo "${names[i]}: its sshd must be OpenSSH 8.2 or later, and allow sk-ssh-ed25519@openssh.com in CASignatureAlgorithms" >&2
       trust_line "$(principal "${names[i]}" "$n")"
       set_account "${names[i]}" "$n"
     elif out=$(edit_account add "$file" "$i" "$(principal "${names[i]}" "$n")"); then

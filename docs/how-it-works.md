@@ -197,9 +197,13 @@ before a file of that name.
 `~/.config/lend-ssh` (or `$XDG_CONFIG_HOME/lend-ssh`) holds:
 
 - `ca`, the signing key, and `ca.pub`; `LEND_SSH_CA` sets another path.
-  After `init -s`, `ca` is an `ed25519-sk` key: a handle that signs only with
-  the security key it was made on, and a touch. sshd checks a certificate
-  signed by it as it would any other, so hosts need nothing new
+  After `init -s`, `ca` is an `ed25519-sk` key made with `verify-required`:
+  a handle that signs only with the security key it was made on, its PIN and
+  a touch. sshd checks a certificate signed by it as it would any other, if
+  it's OpenSSH 8.2 or later and its `CASignatureAlgorithms` allows
+  `sk-ssh-ed25519@openssh.com`, as it does unless set otherwise. `account add`
+  warns when the host's `ssh -V` is older, or a `CASignatureAlgorithms` it can
+  read in the host's sshd config leaves it out
 - `agents/`, a file per agent
 - `keys/`, a directory per agent at a location or given as text, holding its
   public key, `key.pub`, and its latest certificate, `key-cert.pub`
