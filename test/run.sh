@@ -109,7 +109,7 @@ test_cli() {
 
 # shellcheck disable=SC2016  # bash -c scripts take their own arguments
 test_help() {
-  expect "help lists the commands by group" 0 'Set up, once: init create the signing key' \
+  expect "help lists the commands by group" 0 'Set up, once: init \[-s\] create the signing key' \
     bash -c '"$1" help | tr -s " \n" " "' _ "$lend_ssh"
   expect "... and says where to read more" 0 "^'lend-ssh COMMAND -h' shows more about COMMAND.$" "$lend_ssh" help
   expect "a command's -h shows its usage" 0 '^   or: lend-ssh grant -t TIME \[-O' "$lend_ssh" grant -h
@@ -188,6 +188,39 @@ PY
     ssh-keygen -y -P '' -f "$LEND_SSH_CA"
   expect "init refuses an existing key" 1 'already exists' "$lend_ssh" init
   rm -rf "${LEND_SSH_CA%/*}"
+}
+
+# A security key can't be had here, so a fake ssh-keygen stands in for one:
+# it logs its arguments, and makes an ed25519-sk key as a plain ed25519 one,
+# or fails as with no security key plugged in when $work/no-key exists.
+test_init_security_key() {
+  local real
+  real=$(command -v ssh-keygen)
+  mkdir -p "$work/bin"
+  cat >"$work/bin/ssh-keygen" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$work/keygen.log"
+for a; do
+  if [[ \$a == ed25519-sk ]]; then
+    [[ ! -e "$work/no-key" ]] || { echo 'Key enrollment failed: device not found' >&2; exit 255; }
+    set -- "\${@/ed25519-sk/ed25519}"
+    break
+  fi
+done
+exec "$real" "\$@"
+EOF
+  chmod +x "$work/bin/ssh-keygen"
+  PATH=$work/bin:$PATH
+  expect "init -s makes the key on a security key and says to touch it" 0 \
+    'handle to the key on your security key.*touch the security key.*lend-ssh account add' \
+    bash -c '"$@" </dev/null | tr "\n" " "' _ "$lend_ssh" init -s
+  expect "... as ed25519-sk, without a passphrase" 0 "-t ed25519-sk -N  -C lend-ssh CA" cat "$work/keygen.log"
+  rm -rf "${LEND_SSH_CA%/*}"
+  expect "init --security-key is init -s" 0 'touch the security key' "$lend_ssh" init --security-key
+  rm -rf "${LEND_SSH_CA%/*}"
+  touch "$work/no-key"
+  expect "init -s without a security key" 1 'device not found.*is one plugged in' \
+    bash -c '"$@" 2>&1 | tr "\n" " "; exit "${PIPESTATUS[0]}"' _ "$lend_ssh" init -s
 }
 
 # The certificate's validity, from and to, in seconds.
@@ -1189,7 +1222,7 @@ test_completion() {
   completes '-f --force' install -
   completes '' install dir ''
   completes '' init ''
-  completes '' init -
+  completes '-s --security-key' init -
   completes files uninstall ''
   completes '' uninstall dir ''
   completes '' update ''
@@ -1622,6 +1655,7 @@ run test_lint
 run test_cli
 run test_help
 run test_init
+run test_init_security_key
 run test_grant
 run test_revoke
 run test_ssh_agent

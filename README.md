@@ -88,6 +88,13 @@ lend-ssh init
 This creates `~/.config/lend-ssh/ca`, the key that signs certificates, and
 asks for a passphrase for it.
 
+With a FIDO2 security key, such as a YubiKey, `lend-ssh init -s` keeps the
+signing key on it instead. `ca` is then only a handle to the key, useless
+without the security key, and each `grant` and `revoke` asks you to touch it,
+so nothing can sign a certificate without you there. Keep a copy of `ca`: the
+security key alone can't sign without it. It needs OpenSSH 8.2 or later and a
+security key that does ed25519, as most do. Hosts need nothing new.
+
 **2. Set up each account** agents may use:
 
 ```sh
@@ -378,7 +385,8 @@ certificate.
 ## Security
 
 - Your signing key can sign a certificate for any account set up with it.
-  Protect it like your own SSH key, with a passphrase.
+  Protect it like your own SSH key, with a passphrase, or keep it on a
+  security key with `lend-ssh init -s`.
 - Anyone with the agent's private key and a current certificate can log in to
   the accounts it names until it expires.
 - A certificate gives no less than the account it logs into: whatever `dave`
@@ -405,7 +413,7 @@ SSH access to your accounts that ends on its own. An account is [USER@]HOST
 as ssh takes it, your own user name there unless you give USER.
 
 Set up, once:
-  init
+  init [-s]
       create the signing key
   account add [-p] [-k FILE] [USER@]HOST...
       let agents into these accounts

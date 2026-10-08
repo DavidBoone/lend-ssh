@@ -33,7 +33,7 @@ name_re='^[A-Za-z0-9._-]+@[A-Za-z0-9._:-]+$'
 # noun alone lists.
 read -r -d '' command_table <<'EOF' || true
 Set up, once
-init||create the signing key
+init|[-s]|create the signing key
 account add|[-p] [-k FILE] [USER@]HOST...|let agents into these accounts
 agent add|[-f] NAME KEY|name an agent by its public key
 Day to day
@@ -60,6 +60,7 @@ EOF
 # do. A line for each meaning.
 read -r -d '' option_table <<'EOF' || true
 |-h --help||show the commands, or with one, its help
+init|-s --security-key||keep the signing key on a FIDO2 security key
 grant|-t --time|TIME|how long it lasts: 30m, 4h, 1h30m, 2d
 grant|-O --option|OPTION|also allow OPTION, such as permit-port-forwarding
 grant|-I --id|ID|the name hosts log it under (default AGENT)
@@ -78,6 +79,10 @@ command_prose() {
 Creates the signing key, $(tildify "$ca") (set LEND_SSH_CA for another
 path), asking for a passphrase. Load it into your ssh-agent with ssh-add to
 stop typing the passphrase for each grant.
+
+With -s, the key lives on a FIDO2 security key instead: $(tildify "$ca") is
+then only a handle to it, so keep a copy of it with the key. Each grant and
+revoke asks you to touch the security key, and there's no passphrase.
 EOF2
       ;;
     'account add')
@@ -553,12 +558,23 @@ trust_line() {
 }
 
 cmd_init() {
+  local type=ed25519
   [[ $# -eq 0 ]] || usage_error "init takes no arguments"
+  ! opt_value -s >/dev/null || type=ed25519-sk
   [[ ! -e $ca ]] || die "$ca already exists"
   mkdir -p "${ca%/*}"
   chmod 700 "${ca%/*}"
-  ssh-keygen -q -t ed25519 -C "lend-ssh CA ${USER:-$(id -un)}@$(hostname)" -f "$ca"
-  echo "Created $ca. Next, set up each account agents may use:"
+  if [[ $type == ed25519-sk ]]; then
+    # A security key has no passphrase to ask for; a touch guards it.
+    ssh-keygen -q -t "$type" -N '' -C "lend-ssh CA ${USER:-$(id -un)}@$(hostname)" -f "$ca" ||
+      die "couldn't create a key on the security key; is one plugged in, and does it do ed25519-sk?"
+    echo "Created $ca, a handle to the key on your security key; keep a copy of it."
+    echo "Each grant and revoke will ask you to touch the security key."
+  else
+    ssh-keygen -q -t "$type" -C "lend-ssh CA ${USER:-$(id -un)}@$(hostname)" -f "$ca"
+    echo "Created $ca."
+  fi
+  echo "Next, set up each account agents may use:"
   echo "  $prog account add [USER@]HOST"
 }
 
