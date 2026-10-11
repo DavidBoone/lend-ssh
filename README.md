@@ -181,6 +181,10 @@ claude: deploy@build (new), dave@myhost (kept) until 2026-10-04 18:41:07
 
 To change `-O` or `-D` on a valid certificate, `revoke` the agent first.
 
+With `-F` (`--fg`), `grant` stays in the foreground until the certificate
+expires and says so. Pressing Ctrl+C before then revokes the accounts it
+granted, as `revoke` does.
+
 To see who can reach what, `lend-ssh grant` lists the grants,
 `lend-ssh agent` the agents and `lend-ssh account` the accounts:
 
