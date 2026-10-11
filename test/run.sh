@@ -343,6 +343,30 @@ test_grant() {
 }
 
 # shellcheck disable=SC2016  # bash -c scripts take their own arguments
+test_grant_fg() {
+  make_ca
+  keygen "$work/f"
+  "$lend_ssh" account add -p dave@hosta deploy@hostb >/dev/null
+  expect "grant -F needs a kept certificate" 2 '-F needs an agent whose certificate is kept here' \
+    "$lend_ssh" grant -F -t 1h - dave@hosta
+  expect "grant -F holds until the grant expires" 0 'Holding until .* f: expired at [0-9-]+ [0-9:]+; its sessions end within 10 seconds' \
+    bash -c '"$@" 2>&1 | tr "\n" " "' _ "$lend_ssh" grant --fg -t 2s -I f "$work/f" dave@hosta
+  "$lend_ssh" grant -t 1h -I f "$work/f" deploy@hostb >/dev/null
+  # A background job ignores SIGINT; perl restores it, as a terminal's
+  # foreground job has it.
+  perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV' "$lend_ssh" grant -F -t 1h -I f "$work/f" dave@hosta >"$work/fg.out" 2>&1 &
+  local pid=$!
+  sleep 2
+  kill -INT "$pid"
+  local status=0
+  wait "$pid" || status=$?
+  check "Ctrl+C exits 130" test "$status" = 130
+  expect "... revoking what it granted" 0 'f: revoked dave@hosta; keeps deploy@hostb' cat "$work/fg.out"
+  expect "... and leaving the rest" 0 'Principals: deploy@hostb Critical' \
+    bash -c '"$1" agent show "$2" | tr -s " \n" " "' _ "$lend_ssh" "$work/f"
+}
+
+# shellcheck disable=SC2016  # bash -c scripts take their own arguments
 test_revoke() {
   make_ca
   keygen "$work/r"
@@ -1093,7 +1117,7 @@ test_completion() {
   completes 'permit-agent-forwarding' --option = permit-a
   completes 'codex' -t 4h grant co
   completes 'codex' -I me grant -t 4h co
-  completes '-t --time -O --option -I --id -D --no-deadline' -t 4h grant -
+  completes '-t --time -O --option -I --id -D --no-deadline -F --fg' -t 4h grant -
   completes 'add reset rm' -k x account ''
   completes '-p --print -k --file' -k x account add -
   completes '-k --file' -p account add -
@@ -1119,17 +1143,17 @@ test_completion() {
   completes '@10.0.0.1 @box @build @gw @myhost' account add dave @
   completes '@myhost' grant -t 4h key ann @ my
   completes 'dave@10.0.0.1 dave@build dave@gw dave@myhost' account add dave@box dave@
-  completes '-t --time -O --option -I --id -D --no-deadline' grant -
-  completes '--time --option --id --no-deadline' grant --
+  completes '-t --time -O --option -I --id -D --no-deadline -F --fg' grant -
+  completes '--time --option --id --no-deadline --fg' grant --
   completes '--no-deadline' grant --no
-  completes '-t --time -O --option -I --id' grant -D -
+  completes '-t --time -O --option -I --id -F --fg' grant -D -
   completes 'claude codex' grant ''
   completes 'codex' grant -t 4h -I me co
   completes 'codex' grant -D -t 4h co
   completes 'codex' grant --time 4h --id=me co
   completes 'codex' grant -Dt4h co
-  completes '-t --time -O --option -I --id -D --no-deadline' grant claude -
-  completes '-t --time -O --option -I --id' grant claude box -D -t 4h -
+  completes '-t --time -O --option -I --id -D --no-deadline -F --fg' grant claude -
+  completes '-t --time -O --option -I --id -F --fg' grant claude box -D -t 4h -
   completes 'build ann@gw ann@myhost' grant claude -t 4h box ''
   completes 'ann@gw ann@myhost' grant claude -O permit-user-rc box a
   completes '' grant x
@@ -1623,6 +1647,7 @@ run test_cli
 run test_help
 run test_init
 run test_grant
+run test_grant_fg
 run test_revoke
 run test_ssh_agent
 run test_agents

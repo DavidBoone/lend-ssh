@@ -64,6 +64,7 @@ grant|-t --time|TIME|how long it lasts: 30m, 4h, 1h30m, 2d
 grant|-O --option|OPTION|also allow OPTION, such as permit-port-forwarding
 grant|-I --id|ID|the name hosts log it under (default AGENT)
 grant|-D --no-deadline||let sessions run on after the certificate expires
+grant|-F --fg||stay until the grant expires, or revoke it on Ctrl+C
 account add|-p --print||print the lines to add by hand, instead of logging in
 account add,account reset,account rm|-k --file|FILE|the authorized_keys file, if not ~/.ssh/authorized_keys
 agent add|-f --force||replace an agent of that name
@@ -195,6 +196,11 @@ of writing it, and logs it under the key's comment; it keeps no copy, so
 granting again replaces the certificate. -O takes permit-port-forwarding,
 permit-agent-forwarding, permit-X11-forwarding, permit-user-rc, or any
 ssh-keygen -O option.
+
+With -F, grant stays in the foreground until the certificate expires and then
+says so. If you press Ctrl+C before, it revokes the accounts it granted, as
+'revoke AGENT [USER@]HOST...' does. -F needs an agent whose certificate is
+kept here, so not a public key or -.
 EOF2
       ;;
     revoke)
@@ -1108,7 +1114,7 @@ set_up_accounts() {
 }
 
 cmd_grant() {
-  local time='' id='' i o key to='' pub principals tmp='' deadline=1 secs name cert end epoch
+  local time='' id='' fg='' i o key to='' pub principals tmp='' deadline=1 secs name cert end epoch
   local c_end c_id c_deadline now_end
   local -a key_opts=(clear permit-pty) dests names new=() kept=() all=() c_principals c_exts c_crit
   for ((i = 0; i < ${#opts[@]}; i += 2)); do
@@ -1117,6 +1123,7 @@ cmd_grant() {
       -O) key_opts+=("${opts[i + 1]}") ;;
       -I) id=${opts[i + 1]} ;;
       -D) deadline='' ;;
+      -F) fg=1 ;;
     esac
   done
   if [[ $# -eq 0 ]]; then
@@ -1129,6 +1136,10 @@ cmd_grant() {
   ! is_agent "$1" || read_agent "$1"
   [[ -n $id || $key == "$1" ]] || id=$1
   shift
+  local -a hosts=("$@")
+  if [[ -n $fg && ( $key == - || ( ! -e $key && ! -e $key.pub ) ) ]]; then
+    usage_error "-F needs an agent whose certificate is kept here, not a public key or -"
+  fi
   resolve_accounts "$@"
   [[ $time =~ ^([0-9]+[smhdwSMHDW]?)+$ ]] || usage_error "bad time '$time': use 30m, 4h, 1h30m, 2d"
   secs=$(seconds "$time")
@@ -1204,6 +1215,36 @@ cmd_grant() {
     [[ ${#kept[@]} -eq 0 ]] || printf '%s (kept), ' "${kept[@]%%#*}"
     if [[ -n $end ]]; then echo "until $(show_time "$end")"; else echo "no expiry"; fi
   } | sed 's/, until/ until/' >&"$out"
+  [[ -z $fg ]] || hold_grant "$end" "$id" "$agent" "${hosts[@]}"
+}
+
+# For grant -F: waits until certificate end $1 (YYYYMMDDHHMMSS, empty for
+# none), then says $2's grant has expired. On Ctrl+C or SIGTERM before, it
+# revokes agent $3's grant to accounts $4..., as the revoke command does.
+hold_grant() {
+  local end=$1 id=$2
+  shift 2
+  if [[ -z $end ]]; then
+    echo "$id: the certificate has no expiry, so there is nothing to wait for" >&2
+    return
+  fi
+  # shellcheck disable=SC2064  # expand the arguments now
+  trap "grant_interrupted $(printf '%q ' "$@")" INT TERM
+  echo "Holding until $(show_time "$end"); Ctrl+C revokes." >&2
+  while [[ $end > $(date +%Y%m%d%H%M%S) ]]; do
+    sleep 1
+  done
+  trap - INT TERM
+  echo "$id: expired at $(show_time "$end")$([[ -z $deadline ]] || echo '; its sessions end within 10 seconds')"
+}
+
+# What grant -F does on Ctrl+C: revokes agent $1's grant to accounts $2....
+grant_interrupted() {
+  trap '' INT TERM
+  echo >&2
+  opts=()
+  cmd_revoke "$@"
+  exit 130
 }
 
 cmd_revoke() {
