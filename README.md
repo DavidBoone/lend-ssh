@@ -228,7 +228,8 @@ accounts as revoked:
 $ lend-ssh revoke claude deploy@build
 claude: revoked deploy@build; keeps dave@myhost until 2026-10-04 18:41:07; a copy of the certificate, and sessions open there now, work until 2026-10-04 18:41:07, or until 'lend-ssh account reset deploy@build'
 $ lend-ssh grant
-claude: dave@myhost deploy@build (revoked) until 2026-10-04 18:41:07
+claude: dave@myhost until 2026-10-04 18:41:07
+claude: deploy@build (revoked) until 2026-10-04 18:41:07
 ```
 
 ## More

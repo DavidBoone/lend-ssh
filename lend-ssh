@@ -175,7 +175,7 @@ EOF2
       ;;
     grant)
       cat <<'EOF2'
-With nothing named, lists each agent's grant: its accounts and until when,
+With nothing named, lists each agent's grant: a line per account, until when,
 and accounts revoked whose old certificate still works.
 
 Signs AGENT's key with a certificate for these accounts, and writes it beside
@@ -1063,9 +1063,9 @@ expected_words() {
   option_words
 }
 
-# Prints "AGENT: ACCOUNTS until TIME" for each agent with a valid certificate,
-# or accounts revoked whose copies still work, and those of keys that are no
-# agent's now.
+# Prints "AGENT: ACCOUNT until TIME", a line per account, for each agent with
+# a valid certificate or accounts revoked whose copies still work, and for
+# keys that are no agent's now.
 list_grants() {
   local f name key to live status keys='' end p k others='' last='' found=''
   live=$(live_revoked)
@@ -1086,7 +1086,7 @@ list_grants() {
   while read -r name end p; do
     [[ -n $name && $name != "$last" ]] || continue
     last=$name
-    revoked_groups "$(awk -v n="$name" '$1 == n { print $2, $3 }' <<<"$others")" | sed "s/^/$name: /"
+    revoked_lines "$(awk -v n="$name" '$1 == n { print $2, $3 }' <<<"$others")" | sed "s/^/$name: /"
   done < <(sort <<<"$others")
   [[ -n $found$others ]] || echo "No grants. '$prog grant -t TIME AGENT [USER@]HOST...' makes one."
 }
@@ -2093,54 +2093,49 @@ until_text() {
   if [[ -z $1 || $1 == none ]]; then echo ', no expiry'; else echo " until $(show_time "$1")"; fi
 }
 
-# Prints lines $1, "END PRINCIPAL ...", as "ACCOUNTS (revoked) until TIME", a
-# line per end.
-revoked_groups() {
-  local end p last='' shown=''
+# Prints lines $1, "END PRINCIPAL ...", as "ACCOUNT (revoked) until TIME", a
+# line per account, soonest end first.
+revoked_lines() {
+  local end p
   while read -r end p _; do
-    [[ -n $end ]] || continue
-    if [[ $end != "$last" && -n $shown ]]; then
-      echo "$shown$(until_text "$last")"
-      shown=''
-    fi
-    last=$end
-    shown+="${shown:+ }${p%%#*} (revoked)"
+    [[ -z $end ]] || echo "${p%%#*} (revoked)$(until_text "$end")"
   done < <(sort <<<"$1")
-  [[ -z $shown ]] || echo "$shown$(until_text "$last")"
 }
 
-# Prints what certificate $1 opens and until when, then the accounts taken
-# back from it whose copies still work, from live_revoked lines $2, a line
-# per end; or "no grant" when there's neither. An account cancelled since
+# Prints what certificate $1 opens and until when, a line per account, then
+# the accounts taken back from it whose copies still work, from live_revoked
+# lines $2; or "no grant" when there's neither. An account cancelled since
 # shows as cancelled.
 cert_status() {
-  local key=${1%-cert.pub}.pub c_end c_id c_deadline p end name k mine='' rest='' shown='' out
+  local key=${1%-cert.pub}.pub c_end c_id c_deadline p end name k mine='' rest='' out until
   local -a c_principals c_exts c_crit
   [[ ! -d ${key%/*} ]] || key=$(abs_path "$key")
   while read -r end p name k; do
     [[ -z $end || $k != "$key" ]] || mine+="$end $p"$'\n'
   done <<<"${2:-}"
   if cert_info "$1" && cert_valid; then
+    until="$(until_text "$c_end")$([[ -z $c_end || -n $c_deadline ]] || echo ', no session deadline')"
     for p in ${c_principals[@]+"${c_principals[@]}"}; do
       if [[ $(current_principal "${p%%#*}" 2>/dev/null) == "$p" ]]; then
-        shown+=" ${p%%#*}"
+        echo "${p%%#*}$until"
       else
-        shown+=" ${p%%#*} (cancelled)"
+        echo "${p%%#*} (cancelled)$until"
       fi
     done
     while read -r end p; do
       [[ -n $end ]] || continue
-      if [[ $end == "${c_end:-none}" ]]; then shown+=" ${p%%#*} (revoked)"; else rest+="$end $p"$'\n'; fi
+      if [[ $end == "${c_end:-none}" ]]; then echo "${p%%#*} (revoked)$until"; else rest+="$end $p"$'\n'; fi
     done <<<"$mine"
-    echo "${shown# }$(until_text "$c_end")$([[ -z $c_end || -n $c_deadline ]] || echo ', no session deadline')"
+    revoked_lines "$rest"
   else
-    rest=$mine
-    out=$(revoked_groups "$rest")
-    [[ -n $out ]] || out="no grant"
-    echo "$out"
-    return
+    out=$(revoked_lines "$mine")
+    echo "${out:-no grant}"
   fi
-  revoked_groups "$rest"
+}
+
+# Prints cert_status lines $1 as one, for a sentence.
+status_text() {
+  printf '%s\n' "$1" | paste -sd ';' - | sed 's/;/; /g'
 }
 
 cmd_agent() {
@@ -2395,11 +2390,11 @@ cmd_agent_add() {
   fi
   [[ -n $move ]] || return 0
   if [[ $to == - ]]; then
-    echo "its certificate, $(cert_status "$cert"):"
+    echo "its certificate, $(status_text "$(cert_status "$cert")"):"
     cat "$cert"
   else
     send_cert "$to" "$cert" || die "couldn't write $name's certificate to $to; grant again to retry"
-    echo "sent its certificate, $(cert_status "$cert"), to $to"
+    echo "sent its certificate, $(status_text "$(cert_status "$cert")"), to $to"
   fi
 }
 
@@ -2416,7 +2411,7 @@ cmd_agent_rm() {
     cert=${key%.pub}-cert.pub
     if [[ $key == /* && -f $cert ]]; then
       if cert_info "$cert" && cert_valid; then
-        echo "$name: $(cert_status "$cert") -> revoked"
+        cert_status "$cert" | sed "s/^/$name: /; s/\$/ -> revoked/"
         record_revoked "$c_end" "$name" "$key" "${c_principals[@]}"
         if is_location "$to" && ! send_cert "$to"; then
           echo "$prog: couldn't remove the certificate at $to, so it still works there$(until_text "$c_end")" >&2

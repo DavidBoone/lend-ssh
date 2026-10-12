@@ -392,7 +392,8 @@ test_revoke() {
   expect "revoke all of an agent's accounts" 0 '^robot: revoked deploy@hostb; ' "$lend_ssh" revoke "$work/r"
   check "... removes its certificate" test ! -e "$work/r-cert.pub"
   expect "... and grant lists both accounts as revoked" 0 \
-    "^robot: dave@hosta \(revoked\) deploy@hostb \(revoked\) until ${end/T/ }$" "$lend_ssh" grant
+    "^robot: dave@hosta \(revoked\) until ${end/T/ } robot: deploy@hostb \(revoked\) until ${end/T/ } $" \
+    bash -c '"$1" grant | tr "\n" " "' _ "$lend_ssh"
   expect "revoke with nothing granted" 0 '^.*: no grant to revoke$' "$lend_ssh" revoke "$work/r"
   "$lend_ssh" grant -t 4h "$work/r" dave@hosta >/dev/null
   expect "revoking the last account removes the certificate" 0 'revoked dave@hosta' \
@@ -405,16 +406,17 @@ test_revoke() {
     "^robot: dave@hosta until [0-9-]+ [0-9:]+ robot: .*dave@hosta \(revoked\).* until [0-9-]+ [0-9:]+ $" \
     bash -c '"$1" grant | tr "\n" " "' _ "$lend_ssh"
   "$lend_ssh" grant -t 1d robot dave@hosta deploy@hostb >/dev/null
-  expect "... but not one a later grant outlasts" 0 '^robot: dave@hosta deploy@hostb until [0-9-]+ [0-9:]+$' \
-    "$lend_ssh" grant
+  expect "... but not one a later grant outlasts" 0 \
+    '^robot: dave@hosta until [0-9-]+ [0-9:]+ robot: deploy@hostb until [0-9-]+ [0-9:]+ $' \
+    bash -c '"$1" grant | tr "\n" " "' _ "$lend_ssh"
   expect "agent rm lists the agent's accounts as revoked" 0 \
-    '^robot: dave@hosta \(revoked\) deploy@hostb \(revoked\) until [0-9-]+ [0-9:]+$' \
-    bash -c '"$1" agent rm robot >/dev/null && "$1" grant' _ "$lend_ssh"
+    '^robot: dave@hosta \(revoked\) until [0-9-]+ [0-9:]+ robot: deploy@hostb \(revoked\) until [0-9-]+ [0-9:]+ $' \
+    bash -c '"$1" agent rm robot >/dev/null && "$1" grant | tr "\n" " "' _ "$lend_ssh"
   "$lend_ssh" agent add robot "$work/r" >/dev/null
   "$lend_ssh" grant -t 10m robot dave@hosta >/dev/null
   "$lend_ssh" agent rm robot >/dev/null
   expect "grant lists a revoked account once, at its latest end" 0 \
-    '^robot: dave@hosta \(revoked\) deploy@hostb \(revoked\) until [0-9-]+ [0-9:]+ $' \
+    '^robot: dave@hosta \(revoked\) until [0-9-]+ [0-9:]+ robot: deploy@hostb \(revoked\) until [0-9-]+ [0-9:]+ $' \
     bash -c '"$1" grant | tr "\n" " "' _ "$lend_ssh"
   "$lend_ssh" agent add textual "$(cat "$work/r.pub")" >/dev/null
   "$lend_ssh" grant -t 1h textual dave@hosta >/dev/null 2>&1
@@ -422,7 +424,9 @@ test_revoke() {
     bash -c '"$1" grant -t 1h textual deploy@hostb 2>&1 >/dev/null' _ "$lend_ssh"
   expect "revoke an agent given as text prints its new certificate" 0 '^ssh-ed25519-cert-v01@openssh.com ' \
     bash -c '"$1" revoke textual dave@hosta 2>/dev/null' _ "$lend_ssh"
-  expect "... which agent lists" 0 '^	deploy@hostb dave@hosta \(revoked\) until [0-9-]+ [0-9:]+$' "$lend_ssh" agent
+  expect "... which agent lists, an account a line" 0 \
+    '	deploy@hostb until [0-9-]+ [0-9:]+ 	dave@hosta \(revoked\) until [0-9-]+ [0-9:]+ $' \
+    bash -c '"$1" agent | tr "\n" " "' _ "$lend_ssh"
   expect "revoke the last account of an agent given as text prints what it did" 0 \
     '^textual: revoked deploy@hostb; a copy of the certificate' "$lend_ssh" revoke textual
   expect "... on stderr" 0 '^0$' bash -c '"$1" grant -t 1h textual dave@hosta >/dev/null 2>&1; "$1" revoke textual 2>/dev/null | wc -c | tr -d " "' _ "$lend_ssh"
@@ -433,7 +437,7 @@ test_revoke() {
   "$lend_ssh" grant -t 1h linked dave@hosta deploy@hostb >/dev/null 2>&1
   "$lend_ssh" revoke linked dave@hosta >/dev/null 2>&1
   expect "agent lists a revoked account with its config through a symlink" 0 \
-    '^	deploy@hostb dave@hosta \(revoked\) until ' "$lend_ssh" agent
+    '^	dave@hosta \(revoked\) until ' "$lend_ssh" agent
   "$lend_ssh" agent rm linked >/dev/null
   rm "$HOME/.config"
   mv "$work/config" "$HOME/.config"
@@ -736,8 +740,8 @@ test_agents() {
   expect "... under its name" 0 'Key ID: "claude"' "$lend_ssh" agent show claude
   expect "agent show an agent by name" 0 '^ +deploy@hostb$' "$lend_ssh" agent show claude
   expect "agent lists what its certificate opens until when" 0 \
-    "^	dave@hosta deploy@hostb until [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$" "$lend_ssh" agent
-  expect "grant lists the grants" 0 '^claude: dave@hosta deploy@hostb until [0-9-]+ [0-9:]+$' "$lend_ssh" grant
+    "^	deploy@hostb until [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$" "$lend_ssh" agent
+  expect "grant lists the grants" 0 '^claude: deploy@hostb until [0-9-]+ [0-9:]+$' "$lend_ssh" grant
   ssh-keygen -q -s "$LEND_SSH_CA" -I t -n dave@hosta -V 20200101:20200102 "$key.pub"
   expect "agent lists an expired certificate as no grant" 0 '^	no grant$' "$lend_ssh" agent
   expect "grant leaves out an expired certificate" 0 "^No grants. 'lend-ssh grant -t TIME AGENT \[USER@\]HOST\.\.\.' makes one\.$" \
@@ -839,7 +843,7 @@ test_locations() {
   expect "a second grant adds to it" 0 '^c: deploy@hostb \(new\), dave@hosta \(kept\) until ' \
     "$lend_ssh" grant -t 1h c deploy@hostb
   expect "... there" 0 'Principals: deploy@hostb dave@hosta Critical' bash -c 'ssh-keygen -L -f "$1" | tr -s " \n" "  "' _ "$c/id_ed25519-cert.pub"
-  expect "agent lists the grant" 0 '^c docker://box/~/.ssh/id_ed25519.pub deploy@hostb dave@hosta until ' \
+  expect "agent lists the grant" 0 '^c docker://box/~/.ssh/id_ed25519.pub deploy@hostb until [^ ]+ [^ ]+ dave@hosta until ' \
     bash -c '"$1" agent | tr -s "\t\n" "  " | sed "s/.* c docker/c docker/"' _ "$lend_ssh"
   expect "revoke narrows the certificate there" 0 '^c: revoked dave@hosta; keeps deploy@hostb until ' \
     "$lend_ssh" revoke c dave@hosta
@@ -885,12 +889,12 @@ test_locations() {
   expect "grant to a container that's gone" 1 \
     "No such container: box2 lend-ssh: couldn't write c's certificate to docker://box2/~/.ssh/id_ed25519.pub; grant again to retry" \
     bash -c '"$1" grant -t 1h c deploy@hostb 2>&1 | tr "\n" " "; exit "${PIPESTATUS[0]}"' _ "$lend_ssh"
-  expect "... keeping its copy" 0 '^	deploy@hostb dave@hosta until' "$lend_ssh" agent
+  expect "... keeping its copy" 0 '^	deploy@hostb until' "$lend_ssh" agent
   expect "revoke in a container that's gone" 1 \
     "^lend-ssh: couldn't change the certificate at docker://box2/~/.ssh/id_ed25519.pub, so c keeps its grant; revoke again to retry, or 'lend-ssh account reset deploy@hostb' stops it $" \
     bash -c '"$1" revoke c deploy@hostb 2>&1 | grep -v "No such container" | tr "\n" " "; exit "${PIPESTATUS[0]}"' _ "$lend_ssh"
-  expect "... revoking nothing" 0 '^	deploy@hostb dave@hosta until' "$lend_ssh" agent
-  expect "... and noting nothing revoked" 0 '^c: deploy@hostb dave@hosta until [0-9-]+ [0-9:]+$' "$lend_ssh" grant
+  expect "... revoking nothing" 0 '^	deploy@hostb until' "$lend_ssh" agent
+  expect "... and noting nothing revoked" 0 '^c: dave@hosta until [0-9-]+ [0-9:]+$' "$lend_ssh" grant
   expect "... nor when it removes the certificate" 1 "so c keeps its grant" "$lend_ssh" revoke c
   check "... keeping its copy" test -f "$kept/c/key-cert.pub"
   mkdir -p "$fd/containers/box2/.ssh"
