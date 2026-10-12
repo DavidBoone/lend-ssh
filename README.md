@@ -190,7 +190,8 @@ To see who can reach what, `lend-ssh grant` lists the grants,
 
 ```
 $ lend-ssh grant
-claude: dave@myhost deploy@build until 2026-10-04 18:41:07
+claude: dave@myhost until 2026-10-04 18:41:07
+claude: deploy@build until 2026-10-04 18:41:07
 ```
 
 ```
