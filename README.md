@@ -176,7 +176,8 @@ accounts it already has, and the later of the two expiry times:
 
 ```
 $ lend-ssh grant -t 30m claude deploy@build
-claude: deploy@build (new), dave@myhost (kept) until 2026-10-04 18:41:07
+claude: deploy@build (new) until 2026-10-04 18:41:07
+claude: dave@myhost (kept) until 2026-10-04 18:41:07
 ```
 
 To change `-O` or `-D` on a valid certificate, `revoke` the agent first.
@@ -227,7 +228,9 @@ accounts as revoked:
 
 ```
 $ lend-ssh revoke claude deploy@build
-claude: revoked deploy@build; keeps dave@myhost until 2026-10-04 18:41:07; a copy of the certificate, and sessions open there now, work until 2026-10-04 18:41:07, or until 'lend-ssh account reset deploy@build'
+claude: deploy@build (revoked) until 2026-10-04 18:41:07
+claude: dave@myhost until 2026-10-04 18:41:07
+claude: a copy of the certificate, and sessions open there now, work until 2026-10-04 18:41:07, or until 'lend-ssh account reset deploy@build'
 $ lend-ssh grant
 claude: dave@myhost until 2026-10-04 18:41:07
 claude: deploy@build (revoked) until 2026-10-04 18:41:07

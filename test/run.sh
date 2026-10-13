@@ -251,8 +251,8 @@ test_grant() {
   # A grant only adds.
   end=$(cert_end "$work/w-cert.pub")
   expect "a grant keeps the accounts and time already granted" 0 \
-    '^test: deploy@hostb \(new\), dave@hosta \(kept\) until ' \
-    "$lend_ssh" grant -t 30m "$work/w" deploy@hostb
+    '^test: deploy@hostb \(new\) until [0-9-]+ [0-9:]+ test: dave@hosta \(kept\) until [0-9-]+ [0-9:]+ $' \
+    bash -c '"$@" 2>&1 | tr "\n" " "' _ "$lend_ssh" grant -t 30m "$work/w" deploy@hostb
   expect "... both accounts" 0 'Principals: deploy@hostb dave@hosta Critical' \
     bash -c "'$lend_ssh' agent show '$work/w' | tr -s ' \n' ' '"
   expect "... until the later end" 0 "^$end\$" cert_end "$work/w-cert.pub"
@@ -361,7 +361,7 @@ test_grant_fg() {
   local status=0
   wait "$pid" || status=$?
   check "Ctrl+C exits 130" test "$status" = 130
-  expect "... revoking what it granted" 0 'f: revoked dave@hosta; keeps deploy@hostb' cat "$work/fg.out"
+  expect "... revoking what it granted" 0 '^f: dave@hosta \(revoked\) until ' cat "$work/fg.out"
   expect "... and leaving the rest" 0 'Principals: deploy@hostb Critical' \
     bash -c '"$1" agent show "$2" | tr -s " \n" " "' _ "$lend_ssh" "$work/f"
 }
@@ -375,8 +375,8 @@ test_revoke() {
   local end
   end=$(cert_end "$work/r-cert.pub")
   expect "revoke one account" 0 \
-    "^robot: revoked dave@hosta; keeps deploy@hostb until [0-9-]+ [0-9:]+; a copy of the certificate, and sessions open there now, work until [0-9-]+ [0-9:]+, or until 'lend-ssh account reset dave@hosta'$" \
-    "$lend_ssh" revoke "$work/r" dave@hosta
+    "^robot: dave@hosta \(revoked\) until [0-9-]+ [0-9:]+ robot: deploy@hostb until [0-9-]+ [0-9:]+ robot: a copy of the certificate, and sessions open there now, work until [0-9-]+ [0-9:]+, or until 'lend-ssh account reset dave@hosta' $" \
+    bash -c '"$1" revoke "$2" dave@hosta | tr "\n" " "' _ "$lend_ssh" "$work/r"
   expect "... leaving the other" 0 'Principals: deploy@hostb Critical' \
     bash -c '"$1" agent show "$2" | tr -s " \n" " "' _ "$lend_ssh" "$work/r"
   expect "... until the same end" 0 "^$end\$" cert_end "$work/r-cert.pub"
@@ -389,14 +389,14 @@ test_revoke() {
     "^robot: dave@hosta \(revoked\) until ${end/T/ }$" "$lend_ssh" grant
   expect "revoke an account it doesn't have" 1 'robot has no grant for dave@hostc' \
     "$lend_ssh" revoke "$work/r" dave@hostc
-  expect "revoke all of an agent's accounts" 0 '^robot: revoked deploy@hostb; ' "$lend_ssh" revoke "$work/r"
+  expect "revoke all of an agent's accounts" 0 '^robot: deploy@hostb \(revoked\) until ' "$lend_ssh" revoke "$work/r"
   check "... removes its certificate" test ! -e "$work/r-cert.pub"
   expect "... and grant lists both accounts as revoked" 0 \
     "^robot: dave@hosta \(revoked\) until ${end/T/ } robot: deploy@hostb \(revoked\) until ${end/T/ } $" \
     bash -c '"$1" grant | tr "\n" " "' _ "$lend_ssh"
   expect "revoke with nothing granted" 0 '^.*: no grant to revoke$' "$lend_ssh" revoke "$work/r"
   "$lend_ssh" grant -t 4h "$work/r" dave@hosta >/dev/null
-  expect "revoking the last account removes the certificate" 0 'revoked dave@hosta' \
+  expect "revoking the last account removes the certificate" 0 '^test: dave@hosta \(revoked\) until ' \
     "$lend_ssh" revoke "$work/r" dave@hosta
   check "... too" test ! -e "$work/r-cert.pub"
   expect "after revoke, a shorter grant is fine" 0 'dave@hosta \(new\)' \
@@ -420,7 +420,7 @@ test_revoke() {
     bash -c '"$1" grant | tr "\n" " "' _ "$lend_ssh"
   "$lend_ssh" agent add textual "$(cat "$work/r.pub")" >/dev/null
   "$lend_ssh" grant -t 1h textual dave@hosta >/dev/null 2>&1
-  expect "a grant to an agent given as text adds to its certificate" 0 '^textual: deploy@hostb \(new\), dave@hosta \(kept\) until ' \
+  expect "a grant to an agent given as text adds to its certificate" 0 '^textual: deploy@hostb \(new\) until ' \
     bash -c '"$1" grant -t 1h textual deploy@hostb 2>&1 >/dev/null' _ "$lend_ssh"
   expect "revoke an agent given as text prints its new certificate" 0 '^ssh-ed25519-cert-v01@openssh.com ' \
     bash -c '"$1" revoke textual dave@hosta 2>/dev/null' _ "$lend_ssh"
@@ -428,7 +428,7 @@ test_revoke() {
     '	deploy@hostb until [0-9-]+ [0-9:]+ 	dave@hosta \(revoked\) until [0-9-]+ [0-9:]+ $' \
     bash -c '"$1" agent | tr "\n" " "' _ "$lend_ssh"
   expect "revoke the last account of an agent given as text prints what it did" 0 \
-    '^textual: revoked deploy@hostb; a copy of the certificate' "$lend_ssh" revoke textual
+    '^textual: a copy of the certificate' "$lend_ssh" revoke textual
   expect "... on stderr" 0 '^0$' bash -c '"$1" grant -t 1h textual dave@hosta >/dev/null 2>&1; "$1" revoke textual 2>/dev/null | wc -c | tr -d " "' _ "$lend_ssh"
   "$lend_ssh" agent rm textual >/dev/null
   mv "$HOME/.config" "$work/config"
@@ -475,7 +475,8 @@ test_accounts() {
   expect "... with the agents that can reach them, until when" 0 'dave@hosty acct until [0-9-]+ [0-9:]+' \
     bash -c '"$1" account | tr -s "\t\n" "  "' _ "$lend_ssh"
 
-  expect "account rm removes the line, cancelling the grants" 0 '^dave@hosty: removed; cancelled: acct until ' \
+  expect "account rm removes the line, cancelling the grants" 0 '^dave@hosty: removed dave@hosty: cancelled acct until [0-9-]+ [0-9:]+ $' \
+    bash -c '"$@" | tr "\n" " "' _ \
     "${as_host[@]}" account rm dave@hosty
   check "... leaving the file empty" test ! -s "$keys"
   expect "... and moves the account to its next number" 0 '^2 removed$' cat "$HOME/.config/lend-ssh/accounts/dave@hosty"
@@ -492,7 +493,8 @@ test_accounts() {
   expect "... in the certificate" 0 '^ +dave@hosty#2$' "$lend_ssh" agent show acct
 
   expect "account reset moves the account to its next number" 0 \
-    '^dave@hosty: every grant cancelled; cancelled: acct until ' "${as_host[@]}" account reset dave@hosty
+    '^dave@hosty: every grant cancelled dave@hosty: cancelled acct until [0-9-]+ [0-9:]+ $' \
+    bash -c '"$@" | tr "\n" " "' _ "${as_host[@]}" account reset dave@hosty
   expect "... in the line" 0 '^cert-authority,principals="dave@hosty#3" ' grep hosty "$keys"
   expect "... and the record" 0 '^3$' cat "$HOME/.config/lend-ssh/accounts/dave@hosty"
 
@@ -503,7 +505,7 @@ test_accounts() {
   expect "... and account" 0 'dave@hosty acct \(revoked\) until [0-9-]+ [0-9:]+' \
     bash -c '"$1" account | tr -s "\t\n" "  "' _ "$lend_ssh"
   expect "account reset cancels the revoked certificate" 0 \
-    '^dave@hosty: every grant cancelled; cancelled: acct \(revoked\) until ' "${as_host[@]}" account reset dave@hosty
+    '^dave@hosty: cancelled acct \(revoked\) until ' "${as_host[@]}" account reset dave@hosty
   expect "... which then goes from the list" 0 '^	no grant$' "$lend_ssh" agent
 
   if command -v python3 >/dev/null; then
@@ -734,8 +736,8 @@ test_agents() {
   expect "unknown agent command" 2 "unknown agent command 'frob' \(add, show, rm, or none to list\)" \
     "$lend_ssh" agent frob
 
-  expect "grant an agent by name" 0 '^claude: dave@hosta \(new\), deploy@hostb \(new\) until ' \
-    "$lend_ssh" grant -t 4h claude dave@hosta deploy@hostb
+  expect "grant an agent by name" 0 '^claude: dave@hosta \(new\) until [0-9-]+ [0-9:]+ claude: deploy@hostb \(new\) until ' \
+    bash -c '"$@" 2>&1 | tr "\n" " "' _ "$lend_ssh" grant -t 4h claude dave@hosta deploy@hostb
   check "... beside its key" test -f "$key-cert.pub"
   expect "... under its name" 0 'Key ID: "claude"' "$lend_ssh" agent show claude
   expect "agent show an agent by name" 0 '^ +deploy@hostb$' "$lend_ssh" agent show claude
@@ -840,12 +842,12 @@ test_locations() {
     "$lend_ssh" grant -t 1h c dave@hosta
   check "... beside the key" cmp -s "$c/id_ed25519-cert.pub" "$kept/c/key-cert.pub"
   expect "... readable by all" 0 '^-rw-r--r--' ls -l "$c/id_ed25519-cert.pub"
-  expect "a second grant adds to it" 0 '^c: deploy@hostb \(new\), dave@hosta \(kept\) until ' \
+  expect "a second grant adds to it" 0 '^c: deploy@hostb \(new\) until ' \
     "$lend_ssh" grant -t 1h c deploy@hostb
   expect "... there" 0 'Principals: deploy@hostb dave@hosta Critical' bash -c 'ssh-keygen -L -f "$1" | tr -s " \n" "  "' _ "$c/id_ed25519-cert.pub"
   expect "agent lists the grant" 0 '^c docker://box/~/.ssh/id_ed25519.pub deploy@hostb until [^ ]+ [^ ]+ dave@hosta until ' \
     bash -c '"$1" agent | tr -s "\t\n" "  " | sed "s/.* c docker/c docker/"' _ "$lend_ssh"
-  expect "revoke narrows the certificate there" 0 '^c: revoked dave@hosta; keeps deploy@hostb until ' \
+  expect "revoke narrows the certificate there" 0 '^c: dave@hosta \(revoked\) until ' \
     "$lend_ssh" revoke c dave@hosta
   expect "... there" 0 '^ deploy@hostb Critical' bash -c 'ssh-keygen -L -f "$1" | tr -s " \n" "  " | sed "s/.*Principals://"' _ "$c/id_ed25519-cert.pub"
   "$lend_ssh" revoke c >/dev/null
@@ -899,7 +901,7 @@ test_locations() {
   check "... keeping its copy" test -f "$kept/c/key-cert.pub"
   mkdir -p "$fd/containers/box2/.ssh"
   cp "$c/id_ed25519.pub" "$fd/containers/box2/.ssh"
-  expect "revoking again retries" 0 '^c: revoked deploy@hostb; keeps dave@hosta until ' \
+  expect "revoking again retries" 0 '^c: deploy@hostb \(revoked\) until ' \
     "$lend_ssh" revoke c deploy@hostb
   expect "... there" 0 '^ dave@hosta Critical' bash -c 'ssh-keygen -L -f "$1" | tr -s " \n" "  " | sed "s/.*Principals://"' _ "$fd/containers/box2/.ssh/id_ed25519-cert.pub"
   rm -r "$fd/containers/box2"

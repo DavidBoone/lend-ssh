@@ -664,7 +664,8 @@ cmd_account_rm() {
       if account_open "${names[i]}" || [[ ! -f $accounts/${names[i]} ]]; then
         set_account "${names[i]}" $((n + 1)) removed
       fi
-      echo "${names[i]}: $out$(cancelled_note "$(principal "${names[i]}" "$n")")"
+      echo "${names[i]}: $out"
+      cancelled_lines "${names[i]}" "$(principal "${names[i]}" "$n")"
     else
       echo "${names[i]}: failed" >&2
       failed=1
@@ -722,12 +723,10 @@ holders() {
   done <<<"$live"
 }
 
-# Prints ", cancelling AGENT's grant (until TIME), …" for the agents holding
-# principal $1, or nothing.
-cancelled_note() {
-  local who
-  who=$(holders "$1")
-  [[ -z $who ]] || printf '; cancelled: %s' "$(printf '%s\n' "$who" | paste -sd, - | sed 's/,/, /g')"
+# Prints "ACCOUNT: cancelled AGENT until TIME", a line per agent, for account
+# $1 and the agents holding its principal $2, or nothing.
+cancelled_lines() {
+  holders "$2" | sed "s/^/$1: cancelled /"
 }
 
 # The public key file for KEY: KEY itself, or KEY.pub beside a private key.
@@ -1115,7 +1114,7 @@ set_up_accounts() {
 
 cmd_grant() {
   local time='' id='' fg='' i o key to='' pub principals tmp='' deadline=1 secs name cert end epoch
-  local c_end c_id c_deadline now_end
+  local c_end c_id c_deadline now_end until p
   local -a key_opts=(clear permit-pty) dests names new=() kept=() all=() c_principals c_exts c_crit
   for ((i = 0; i < ${#opts[@]}; i += 2)); do
     case ${opts[i]} in
@@ -1209,12 +1208,11 @@ cmd_grant() {
   elif [[ -n $to ]]; then
     send_cert "$to" "$cert" || die "couldn't write $agent's certificate to $to; grant again to retry"
   fi
+  until=$(until_text "$end")
   {
-    printf '%s: ' "$id"
-    printf '%s (new), ' "${new[@]%%#*}"
-    [[ ${#kept[@]} -eq 0 ]] || printf '%s (kept), ' "${kept[@]%%#*}"
-    if [[ -n $end ]]; then echo "until $(show_time "$end")"; else echo "no expiry"; fi
-  } | sed 's/, until/ until/' >&"$out"
+    for p in "${new[@]}"; do echo "$id: ${p%%#*} (new)$until"; done
+    for p in ${kept[@]+"${kept[@]}"}; do echo "$id: ${p%%#*} (kept)$until"; done
+  } >&"$out"
   [[ -z $fg ]] || hold_grant "$end" "$id" "$agent" "${hosts[@]}"
 }
 
@@ -1308,9 +1306,9 @@ cmd_revoke() {
   fi
   record_revoked "$c_end" "$name" "$(pubkey_of "$key")" "${gone[@]}"
   {
-    printf '%s: revoked %s' "$c_id" "$(printf '%s\n' "${gone[@]%%#*}" | paste -sd, - | sed 's/,/, /g')"
-    [[ ${#keep[@]} -eq 0 ]] || printf '; keeps %s%s' "$(printf '%s\n' "${keep[@]%%#*}" | paste -sd, - | sed 's/,/, /g')" "$end"
-    echo "$left"
+    for p in "${gone[@]}"; do echo "$c_id: ${p%%#*} (revoked)$end"; done
+    for p in ${keep[@]+"${keep[@]}"}; do echo "$c_id: ${p%%#*}$end"; done
+    echo "$c_id: ${left#; }"
   } >&"$out"
 }
 
@@ -1330,9 +1328,13 @@ cmd_account_reset() {
     n=$(account_number "${names[i]}")
     if out=$(edit_account add "$file" "$i" "$(principal "${names[i]}" $((n + 1)))"); then
       local note
-      note=$(cancelled_note "$(principal "${names[i]}" "$n")")
+      note=$(cancelled_lines "${names[i]}" "$(principal "${names[i]}" "$n")")
       set_account "${names[i]}" $((n + 1))
-      echo "${names[i]}: every grant cancelled${note:-; there were none}"
+      if [[ -n $note ]]; then
+        printf '%s: every grant cancelled\n%s\n' "${names[i]}" "$note"
+      else
+        echo "${names[i]}: every grant cancelled; there were none"
+      fi
     else
       echo "${names[i]}: failed" >&2
       failed=1
