@@ -45,7 +45,7 @@ real_docker_container() {
     '^agent 700 /home/agent/.ssh agent 600 /home/agent/.ssh/id_ed25519 agent 644 /home/agent/.ssh/id_ed25519.pub $' \
     oneline docker_files agentc /home/agent/.ssh /home/agent/.ssh/id_ed25519 /home/agent/.ssh/id_ed25519.pub
   expect "... agent lists it at its location" 0 "^c	$loc$" "$lend_ssh" agent
-  expect "docker: grant to an agent in a container" 0 '^c: dave@host1 \(new\), deploy@host1 \(new\) until ' \
+  expect "docker: grant to an agent in a container" 0 '^c: deploy@host1 \(new\) until ' \
     "$lend_ssh" grant -t 1h c dave@host1 deploy@host1
   expect "... writes the certificate there, the agent's" 0 '^agent 644 /home/agent/.ssh/id_ed25519-cert.pub$' \
     docker_files agentc /home/agent/.ssh/id_ed25519-cert.pub

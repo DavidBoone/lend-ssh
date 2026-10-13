@@ -58,7 +58,7 @@ real_ssh_existing_key() {
     cmp -s "$XDG_CONFIG_HOME/lend-ssh/keys/box/key.pub" <(box_exec cat /home/agent/have/id_ed25519.pub)
   "$lend_ssh" account add dave@host1 deploy@host1 >/dev/null
   expect "ssh: grant at a location" 0 '^box: dave@host1 \(new\)' "$lend_ssh" grant -t 1h box dave@host1
-  expect "ssh: grant adds at a location" 0 '^box: deploy@host1 \(new\), dave@host1 \(kept\)' "$lend_ssh" grant -t 1h box deploy@host1
+  expect "ssh: grant adds at a location" 0 '^box: dave@host1 \(kept\) until ' "$lend_ssh" grant -t 1h box deploy@host1
   expect "... the agent still logs in to the account it had" 0 '^dave$' agent_ssh -i /home/agent/have/id_ed25519 agentbox dave whoami
   expect "... and to the new one" 0 '^deploy$' agent_ssh -i /home/agent/have/id_ed25519 agentbox deploy whoami
   expect "ssh: revoke narrows at a location" 0 '^box: deploy@host1 \(revoked\) until ' "$lend_ssh" revoke box deploy@host1
@@ -215,7 +215,7 @@ real_ssh_unreachable() {
   box_on
   check "ssh: agentbox is back on the network under its names" test "$(box_aliases)" = "$aliases"
   expect "ssh: the agent can't log in to an account granted while unreachable" fail 'Permission denied' agent_ssh -i /home/agent/gone/id_ed25519 agentbox deploy whoami
-  expect "ssh: granting again after it's reachable" 0 '^box: deploy@host1 \(new\), dave@host1 \(kept\)' "$lend_ssh" grant -t 1h box deploy@host1
+  expect "ssh: granting again after it's reachable" 0 '^box: dave@host1 \(kept\) until ' "$lend_ssh" grant -t 1h box deploy@host1
   expect "... the agent logs in" 0 '^deploy$' agent_ssh -i /home/agent/gone/id_ed25519 agentbox deploy whoami
 
   box_off

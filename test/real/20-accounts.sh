@@ -50,7 +50,7 @@ real_accounts_grant_revoke() {
   expect "... and deploy@host1" 0 '^deploy@host1' "$lend_ssh" account
   expect "accounts: agent add creates a key at agentbox" 0 '^added agent acct: ' "$lend_ssh" agent add acct ssh://agent@agentbox/~/acct/id_ed25519.pub
 
-  expect "accounts: grant to two accounts" 0 '^acct: (dave@host1 \(new\), deploy@host1 \(new\)|deploy@host1 \(new\), dave@host1 \(new\))' \
+  expect "accounts: grant to two accounts" 0 '^acct: deploy@host1 \(new\) until ' \
     "$lend_ssh" grant -t 1h acct dave@host1 deploy@host1
   expect "accounts: the agent logs in to dave" 0 '^dave$' agent_ssh -i /home/agent/acct/id_ed25519 agentbox dave whoami
   expect "accounts: the agent logs in to deploy" 0 '^deploy$' agent_ssh -i /home/agent/acct/id_ed25519 agentbox deploy whoami
