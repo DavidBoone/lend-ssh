@@ -483,6 +483,16 @@ ca_blob() {
   cut -d' ' -f2 "$ca.pub"
 }
 
+# Prints the CA public key's fingerprint, the way ssh-keygen -L names a
+# certificate's Signing CA, so cert_info can tell ours from any other. Read
+# once, then kept in ca_fp.
+ca_fp=''
+ca_fingerprint() {
+  [[ -n $ca_fp ]] || ca_fp=$(ssh-keygen -lf "$ca.pub" 2>/dev/null | cut -d' ' -f2)
+  [[ -n $ca_fp ]] || return 1
+  echo "$ca_fp"
+}
+
 # Sets ca_args to ssh-keygen's arguments for signing with the CA: its copy in
 # your ssh-agent if it has one, else its private key file.
 ca_signer() {
@@ -947,6 +957,25 @@ done
 EOF2
 }
 
+# Puts certificate $1 at path $2, next to the agent's key. It refuses to write
+# through a symlink or onto anything but a regular file, and lands the file
+# with a rename, so an agent that can write the directory can't redirect the
+# write at one of your files (~/.bashrc and the like) or race a planted name.
+install_cert() {
+  local dir=${2%/*} tmpf
+  [[ $dir != "$2" ]] || dir=.
+  [[ ! -L $2 ]] ||
+    { echo "$prog: refusing to write the certificate through the symlink $2" >&2; return 1; }
+  [[ ! -e $2 || -f $2 ]] ||
+    { echo "$prog: $2 isn't a regular file" >&2; return 1; }
+  tmpf=$(mktemp "$dir/.lend-ssh-cert.XXXXXX") || return 1
+  if cp "$1" "$tmpf" && chmod 644 "$tmpf" && mv -f "$tmpf" "$2"; then
+    return 0
+  fi
+  rm -f "$tmpf"
+  return 1
+}
+
 # Writes certificate file $2 to location $1, or with no $2, removes the
 # certificate there. Fails, after ssh's or docker's message, if it can't.
 send_cert() {
@@ -984,9 +1013,15 @@ deadline_command() {
 # takes them) and c_deadline (the epoch of lend-ssh's session deadline, if it
 # has one). Fails if there's no readable certificate.
 cert_info() {
-  local info tag value name
-  c_principals=() c_exts=() c_crit=() c_end='' c_id='' c_deadline=''
+  local info tag value name signer
+  c_principals=() c_exts=() c_crit=() c_end='' c_id='' c_deadline='' c_ca_ok=''
   [[ -f $1 ]] && info=$(ssh-keygen -L -f "$1" 2>/dev/null) || return 1
+  # Record whether our own CA signed this. grant and revoke must not add up or
+  # re-sign a certificate it didn't (cert_our_ca), or an agent that can write
+  # its key's directory could plant one carrying extra accounts and no expiry
+  # for the real CA to re-sign. Listing and completion read either kind.
+  signer=$(sed -n 's/^        Signing CA: [^ ]* \([^ ]*\).*/\1/p' <<<"$info")
+  [[ -n $signer && $signer == "$(ca_fingerprint)" ]] && c_ca_ok=1
   while IFS= read -r line; do
     tag=${line%% *} value=${line#* }
     case $tag in
@@ -1024,6 +1059,12 @@ cert_info() {
 # True when the certificate cert_info read is valid now.
 cert_valid() {
   [[ -z $c_end || $c_end > $(date +%Y%m%d%H%M%S) ]]
+}
+
+# True when the certificate cert_info read was signed by our own CA, so grant
+# and revoke may add up or re-sign from it.
+cert_our_ca() {
+  [[ $c_ca_ok == 1 ]]
 }
 
 # Prints the options of a certificate as words to compare: its extensions and
@@ -1114,7 +1155,7 @@ set_up_accounts() {
 
 cmd_grant() {
   local time='' id='' fg='' i o key to='' pub principals tmp='' deadline=1 secs name cert end epoch
-  local c_end c_id c_deadline now_end until p
+  local c_end c_id c_deadline c_ca_ok now_end until p
   local -a key_opts=(clear permit-pty) dests names new=() kept=() all=() c_principals c_exts c_crit
   for ((i = 0; i < ${#opts[@]}; i += 2)); do
     case ${opts[i]} in
@@ -1175,7 +1216,7 @@ cmd_grant() {
   end=$now_end
   # A grant only adds: while the key's certificate is valid, the new one
   # keeps its accounts that are still open and its end, if later.
-  if [[ -z $tmp ]] && cert_info "$cert" && cert_valid; then
+  if [[ -z $tmp ]] && cert_info "$cert" && cert_valid && cert_our_ca; then
     local had want
     had=$(option_words)
     want=$(expected_words "${key_opts[@]}")
@@ -1192,18 +1233,37 @@ cmd_grant() {
   fi
   all=("${new[@]}" ${kept[@]+"${kept[@]}"})
 
+  # Sign into a private directory, never straight beside the agent's key: an
+  # agent that can write there could point -cert.pub at one of your files
+  # through a symlink, and ssh-keygen would write the agent's comment into it.
+  local signtmp='' signpub=$pub signcert=$cert
+  if [[ -z $tmp ]]; then
+    signtmp=$(mktemp -d)
+    # shellcheck disable=SC2064  # expand $signtmp now
+    trap "rm -rf '$signtmp'" EXIT
+    cp "$pub" "$signtmp/key.pub"
+    signpub=$signtmp/key.pub
+    signcert=$signtmp/key-cert.pub
+  fi
+
   local -a ca_args args=()
   ca_signer
   for o in "${key_opts[@]}"; do args+=(-O "$o"); done
   [[ -z $deadline ]] || args+=(-O "force-command=$(deadline_command "$epoch" "${all[@]}")")
   # Starting 5 minutes back allows for a host whose clock runs slow.
   ssh-keygen -q "${ca_args[@]}" -I "$id" -n "$(IFS=,; echo "${all[*]}")" \
-    -V "-5m:${end:-forever}" ${args[@]+"${args[@]}"} "$pub" >&2
+    -V "-5m:${end:-forever}" ${args[@]+"${args[@]}"} "$signpub" >&2
+  # Land the certificate where it belongs, unless the key was given inline and
+  # so lives only in $tmp: beside the agent's own key, or in the copy lend-ssh
+  # keeps for a key at a location or given as text.
+  [[ -n $tmp ]] ||
+    install_cert "$signcert" "$cert" ||
+    die "couldn't write $agent's certificate to $(tildify "$cert"); grant again to retry"
   # The certificate goes to stdout when it isn't sent where the agent is, and
   # what grant did to stderr.
   local out=1
   if [[ -n $tmp || $to == - ]]; then
-    cat "$cert"
+    cat "$signcert"
     out=2
   elif [[ -n $to ]]; then
     send_cert "$to" "$cert" || die "couldn't write $agent's certificate to $to; grant again to retry"
@@ -1247,7 +1307,7 @@ grant_interrupted() {
 
 cmd_revoke() {
   [[ $# -gt 0 ]] || usage_error "revoke takes an AGENT, and the accounts to take back"
-  local key to='' cert c_end c_id c_deadline name p left='' end out=1 sent=1
+  local key to='' cert c_end c_id c_deadline c_ca_ok name p left='' end out=1 sent=1
   local -a dests names c_principals c_exts c_crit keep=() gone=() bases=()
   key=$(agent_key "$1")
   ! is_agent "$1" || read_agent "$1"
@@ -1255,7 +1315,7 @@ cmd_revoke() {
     die "$1's certificate isn't kept here, so it can't be narrowed; '$prog account reset [USER@]HOST' cancels it"
   cert=$(pubkey_of "$key")
   cert=${cert%.pub}-cert.pub
-  if ! cert_info "$cert" || ! cert_valid; then
+  if ! cert_info "$cert" || ! cert_valid || ! cert_our_ca; then
     echo "$1: no grant to revoke"
     return
   fi
