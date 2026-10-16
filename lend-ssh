@@ -483,15 +483,9 @@ ca_blob() {
   cut -d' ' -f2 "$ca.pub"
 }
 
-# Prints the CA public key's fingerprint, the way ssh-keygen -L names a
-# certificate's Signing CA, so cert_info can tell ours from any other. Read
-# once, then kept in ca_fp.
+# The CA public key's fingerprint, as ssh-keygen -L names a certificate's
+# Signing CA, once cert_info has read it.
 ca_fp=''
-ca_fingerprint() {
-  [[ -n $ca_fp ]] || ca_fp=$(ssh-keygen -lf "$ca.pub" 2>/dev/null | cut -d' ' -f2)
-  [[ -n $ca_fp ]] || return 1
-  echo "$ca_fp"
-}
 
 # Sets ca_args to ssh-keygen's arguments for signing with the CA: its copy in
 # your ssh-agent if it has one, else its private key file.
@@ -714,7 +708,7 @@ cmd_account() {
 # $1 now, and "AGENT (revoked) until TIME" for each of live_revoked lines $2
 # (found if not given) for it.
 holders() {
-  local f name key to c_end c_id c_deadline end p live
+  local f name key to c_end c_id c_deadline c_ca_ok end p live
   local -a c_principals c_exts c_crit
   if [[ $# -gt 1 ]]; then live=$2; else live=$(live_revoked); fi
   for f in "$agents"/*; do
@@ -914,7 +908,8 @@ EOF2
 # others, the script prints their names, one per line, and exits 76. It writes into an
 # existing directory, or one it makes in an existing directory, else exits 75.
 # Its files and any directory it makes belong to the owner of the directory
-# they're in.
+# they're in. It writes each to a new file, which set -C won't open through a
+# symlink the agent may have put there, and renames that over the path.
 put_script() {
   local i=0
   echo set -e
@@ -944,8 +939,8 @@ put() {
   esac
   t="$1.lend-ssh.$$"
   trap 'rm -f "$t"' EXIT
-  printf '%s\n' "$2" >"$t"
-  [ "$(id -u)" != 0 ] || chown "$(owner "$d")" "$t"
+  (set -C && printf '%s\n' "$2" >"$t")
+  [ "$(id -u)" != 0 ] || chown -h "$(owner "$d")" "$t"
   mv "$t" "$1"
   trap - EXIT
 }
@@ -957,23 +952,40 @@ done
 EOF2
 }
 
-# Puts certificate $1 at path $2, next to the agent's key. It refuses to write
-# through a symlink or onto anything but a regular file, and lands the file
-# with a rename, so an agent that can write the directory can't redirect the
-# write at one of your files (~/.bashrc and the like) or race a planted name.
+# Puts certificate file $1 at path $2, beside the agent's key, in a directory
+# the agent may be able to write. It refuses a symlink or anything but a
+# regular file at $2. It writes a new file of a random name, which set -C
+# won't open through a symlink planted there meanwhile, and renames it to $2,
+# which replaces whatever is there then without writing into it.
 install_cert() {
-  local dir=${2%/*} tmpf
+  local dir=${2%/*} t
   [[ $dir != "$2" ]] || dir=.
   [[ ! -L $2 ]] ||
     { echo "$prog: refusing to write the certificate through the symlink $2" >&2; return 1; }
   [[ ! -e $2 || -f $2 ]] ||
     { echo "$prog: $2 isn't a regular file" >&2; return 1; }
-  tmpf=$(mktemp "$dir/.lend-ssh-cert.XXXXXX") || return 1
-  if cp "$1" "$tmpf" && chmod 644 "$tmpf" && mv -f "$tmpf" "$2"; then
+  t=$(mktemp -u "$dir/.lend-ssh-cert.XXXXXX") || return 1
+  if (set -C && umask 022 && cat "$1" >"$t") && mv -f "$t" "$2"; then
     return 0
   fi
-  rm -f "$tmpf"
+  rm -f "$t"
   return 1
+}
+
+# Signs public key file $1 with the CA, as ca_signer set ca_args, and
+# ssh-keygen arguments $3..., and puts the certificate at $2 with
+# install_cert. It signs a copy in a directory of its own, as ssh-keygen
+# writes the certificate beside the key, through any symlink there.
+sign_cert() {
+  local pub=$1 cert=$2 dir ok=''
+  shift 2
+  dir=$(mktemp -d) || return 1
+  cp "$pub" "$dir/key.pub" &&
+    ssh-keygen -q "${ca_args[@]}" "$@" "$dir/key.pub" >&2 &&
+    install_cert "$dir/key-cert.pub" "$cert" &&
+    ok=1
+  rm -rf "$dir"
+  [[ -n $ok ]]
 }
 
 # Writes certificate file $2 to location $1, or with no $2, removes the
@@ -1016,12 +1028,11 @@ cert_info() {
   local info tag value name signer
   c_principals=() c_exts=() c_crit=() c_end='' c_id='' c_deadline='' c_ca_ok=''
   [[ -f $1 ]] && info=$(ssh-keygen -L -f "$1" 2>/dev/null) || return 1
-  # Record whether our own CA signed this. grant and revoke must not add up or
-  # re-sign a certificate it didn't (cert_our_ca), or an agent that can write
-  # its key's directory could plant one carrying extra accounts and no expiry
-  # for the real CA to re-sign. Listing and completion read either kind.
+  # An agent that can write its key's directory can plant a certificate signed
+  # by a CA of its own, so cert_valid holds only for one our CA signed.
   signer=$(sed -n 's/^        Signing CA: [^ ]* \([^ ]*\).*/\1/p' <<<"$info")
-  [[ -n $signer && $signer == "$(ca_fingerprint)" ]] && c_ca_ok=1
+  [[ -n $ca_fp ]] || ca_fp=$(ssh-keygen -lf "$ca.pub" 2>/dev/null | cut -d' ' -f2) || true
+  [[ -z $signer || $signer != "$ca_fp" ]] || c_ca_ok=1
   while IFS= read -r line; do
     tag=${line%% *} value=${line#* }
     case $tag in
@@ -1056,15 +1067,9 @@ cert_info() {
     END { flush() }' <<<"$info")
 }
 
-# True when the certificate cert_info read is valid now.
+# True when the certificate cert_info read is valid now, and our CA signed it.
 cert_valid() {
-  [[ -z $c_end || $c_end > $(date +%Y%m%d%H%M%S) ]]
-}
-
-# True when the certificate cert_info read was signed by our own CA, so grant
-# and revoke may add up or re-sign from it.
-cert_our_ca() {
-  [[ $c_ca_ok == 1 ]]
+  [[ $c_ca_ok == 1 ]] && [[ -z $c_end || $c_end > $(date +%Y%m%d%H%M%S) ]]
 }
 
 # Prints the options of a certificate as words to compare: its extensions and
@@ -1216,7 +1221,7 @@ cmd_grant() {
   end=$now_end
   # A grant only adds: while the key's certificate is valid, the new one
   # keeps its accounts that are still open and its end, if later.
-  if [[ -z $tmp ]] && cert_info "$cert" && cert_valid && cert_our_ca; then
+  if [[ -z $tmp ]] && cert_info "$cert" && cert_valid; then
     local had want
     had=$(option_words)
     want=$(expected_words "${key_opts[@]}")
@@ -1233,37 +1238,19 @@ cmd_grant() {
   fi
   all=("${new[@]}" ${kept[@]+"${kept[@]}"})
 
-  # Sign into a private directory, never straight beside the agent's key: an
-  # agent that can write there could point -cert.pub at one of your files
-  # through a symlink, and ssh-keygen would write the agent's comment into it.
-  local signtmp='' signpub=$pub signcert=$cert
-  if [[ -z $tmp ]]; then
-    signtmp=$(mktemp -d)
-    # shellcheck disable=SC2064  # expand $signtmp now
-    trap "rm -rf '$signtmp'" EXIT
-    cp "$pub" "$signtmp/key.pub"
-    signpub=$signtmp/key.pub
-    signcert=$signtmp/key-cert.pub
-  fi
-
   local -a ca_args args=()
   ca_signer
   for o in "${key_opts[@]}"; do args+=(-O "$o"); done
   [[ -z $deadline ]] || args+=(-O "force-command=$(deadline_command "$epoch" "${all[@]}")")
   # Starting 5 minutes back allows for a host whose clock runs slow.
-  ssh-keygen -q "${ca_args[@]}" -I "$id" -n "$(IFS=,; echo "${all[*]}")" \
-    -V "-5m:${end:-forever}" ${args[@]+"${args[@]}"} "$signpub" >&2
-  # Land the certificate where it belongs, unless the key was given inline and
-  # so lives only in $tmp: beside the agent's own key, or in the copy lend-ssh
-  # keeps for a key at a location or given as text.
-  [[ -n $tmp ]] ||
-    install_cert "$signcert" "$cert" ||
+  sign_cert "$pub" "$cert" -I "$id" -n "$(IFS=,; echo "${all[*]}")" \
+    -V "-5m:${end:-forever}" ${args[@]+"${args[@]}"} ||
     die "couldn't write $agent's certificate to $(tildify "$cert"); grant again to retry"
   # The certificate goes to stdout when it isn't sent where the agent is, and
   # what grant did to stderr.
   local out=1
   if [[ -n $tmp || $to == - ]]; then
-    cat "$signcert"
+    cat "$cert"
     out=2
   elif [[ -n $to ]]; then
     send_cert "$to" "$cert" || die "couldn't write $agent's certificate to $to; grant again to retry"
@@ -1315,7 +1302,7 @@ cmd_revoke() {
     die "$1's certificate isn't kept here, so it can't be narrowed; '$prog account reset [USER@]HOST' cancels it"
   cert=$(pubkey_of "$key")
   cert=${cert%.pub}-cert.pub
-  if ! cert_info "$cert" || ! cert_valid || ! cert_our_ca; then
+  if ! cert_info "$cert" || ! cert_valid; then
     echo "$1: no grant to revoke"
     return
   fi
@@ -1349,8 +1336,9 @@ cmd_revoke() {
     for p in ${c_exts[@]+"${c_exts[@]}"}; do args+=(-O "$p"); done
     for p in ${c_crit[@]+"${c_crit[@]}"}; do args+=(-O "$p"); done
     [[ -z $c_deadline ]] || args+=(-O "force-command=$(deadline_command "$c_deadline" "${keep[@]}")")
-    ssh-keygen -q "${ca_args[@]}" -I "$c_id" -n "$(IFS=,; echo "${keep[*]}")" \
-      -V "-5m:${c_end:-forever}" "${args[@]}" "$(pubkey_of "$key")"
+    sign_cert "$(pubkey_of "$key")" "$cert" -I "$c_id" -n "$(IFS=,; echo "${keep[*]}")" \
+      -V "-5m:${c_end:-forever}" "${args[@]}" ||
+      die "couldn't write $c_id's certificate to $(tildify "$cert"); revoke again to retry"
   fi
   # As grant does, revoke prints a new certificate it doesn't send.
   if [[ $to == - ]]; then
@@ -1736,7 +1724,7 @@ open_accounts() {
 # Prints the names of the accounts that the valid certificate of agent or key
 # $1 is for.
 granted_accounts() {
-  local key pub p c_end c_id c_deadline
+  local key pub p c_end c_id c_deadline c_ca_ok
   local -a c_principals c_exts c_crit
   key=$(agent_key "$1" 2>/dev/null) && pub=$(pubkey_of "$key" 2>/dev/null) || return 0
   cert_info "${pub%.pub}-cert.pub" && cert_valid || return 0
@@ -2110,7 +2098,7 @@ agent_key() {
 # an account not reset or removed since, and not outlasted by the key's
 # certificate now or a later line; one line per account and key.
 live_revoked() {
-  local end p name key now c_end c_id c_deadline
+  local end p name key now c_end c_id c_deadline c_ca_ok
   local -a c_principals c_exts c_crit
   [[ -f $revoked ]] || return 0
   now=$(date +%Y%m%d%H%M%S)
@@ -2169,7 +2157,7 @@ revoked_lines() {
 # lines $2; or "no grant" when there's neither. An account cancelled since
 # shows as cancelled.
 cert_status() {
-  local key=${1%-cert.pub}.pub c_end c_id c_deadline p end name k mine='' rest='' out until
+  local key=${1%-cert.pub}.pub c_end c_id c_deadline c_ca_ok p end name k mine='' rest='' out until
   local -a c_principals c_exts c_crit
   [[ ! -d ${key%/*} ]] || key=$(abs_path "$key")
   while read -r end p name k; do
@@ -2229,7 +2217,7 @@ cmd_agent() {
 # whose certificate lend-ssh keeps a copy of, which goes to the new location;
 # or $2 is "here" and $3 is the same key file, for an agent whose key is here.
 check_replace() {
-  local key to c_end c_id c_deadline
+  local key to c_end c_id c_deadline c_ca_ok
   local -a c_principals c_exts c_crit
   is_agent "$1" || return 0
   read_agent "$1"
@@ -2366,7 +2354,7 @@ add_at_host() {
 }
 
 cmd_agent_add() {
-  local force='' name key pub priv to='' tmp old_to='' cert c_end c_id c_deadline
+  local force='' name key pub priv to='' tmp old_to='' cert c_end c_id c_deadline c_ca_ok
   local -a c_principals c_exts c_crit
   ! opt_value -f >/dev/null || force=1
   [[ $# -eq 2 ]] || usage_error "agent add takes a NAME and a KEY"
@@ -2462,7 +2450,7 @@ cmd_agent_add() {
 
 # Removing an agent deletes its certificate first, as revoke would.
 cmd_agent_rm() {
-  local name key to cert c_end c_id c_deadline failed=''
+  local name key to cert c_end c_id c_deadline c_ca_ok failed=''
   local -a c_principals c_exts c_crit
   [[ $# -gt 0 ]] || usage_error "agent rm takes the agents' names"
   for name in "$@"; do

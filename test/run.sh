@@ -489,6 +489,15 @@ test_forged() {
     'refusing to write the certificate through the symlink' \
     "$lend_ssh" grant -t 10m "$work/agent" dave@hosta
   check "... leaving the target untouched" test "$(cat "$work/victim")" = untouched
+
+  # Nor may a planted certificate hide a revoked one that still works.
+  rm -f "$work/agent-cert.pub"
+  "$lend_ssh" grant -t 10m "$work/agent" dave@hosta >/dev/null
+  princ=$(ssh-keygen -L -f "$work/agent-cert.pub" | sed -n '/Principals:/{n;s/^ *//;p;}')
+  "$lend_ssh" revoke "$work/agent" >/dev/null
+  ssh-keygen -q -s "$work/evilca" -I agent -n "$princ" -V always:forever "$work/agent.pub"
+  expect "grant lists a revoked account under a certificate another CA signed" 0 \
+    '^test: dave@hosta \(revoked\) until ' "$lend_ssh" grant
 }
 
 # account and account reset, with ~/.ssh/authorized_keys or -k FILE, through an
@@ -1126,8 +1135,8 @@ test_completion() {
   echo '2 removed' >"$accounts/$me@gw"
   mkdir -p "$HOME/.config/lend-ssh/agents"
   keygen "$work/claude"
-  keygen "$work/ca"
-  ssh-keygen -q -s "$work/ca" -I claude -n "ann@myhost#2,$me@10.0.0.9" -V -5m:+1h "$work/claude.pub"
+  make_ca
+  ssh-keygen -q -s "$LEND_SSH_CA" -I claude -n "ann@myhost#2,$me@10.0.0.9" -V -5m:+1h "$work/claude.pub"
   echo "$work/claude.pub" >"$HOME/.config/lend-ssh/agents/claude"
   echo "$work/codex.pub" >"$HOME/.config/lend-ssh/agents/codex"
   echo "$work/old.pub" >"$HOME/.config/lend-ssh/agents/co.old"

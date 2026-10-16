@@ -59,7 +59,9 @@ A certificate from `grant`:
   or `agent` for a key without one
 
 A grant only adds: while the agent's certificate is valid, the new one keeps
-the accounts it already opens, and its end if that's later. A grant with other
+the accounts it already opens, and its end if that's later. lend-ssh counts
+a certificate as valid only when your CA signed it, so one the agent writes
+itself, signed by another CA, counts as none, everywhere lend-ssh reads one. A grant with other
 options than the current certificate's, such as `-O` or `-D`, is refused until
 you `revoke` the agent.
 
@@ -150,8 +152,8 @@ digits and `._@+-/`. `LEND_SSH_VOLUME_IMAGE` sets another image than
 that the volume exists before it runs the container, since `docker run`
 would create one with a mistyped name.
 
-The script writes a file to a temporary name beside it, then moves it into
-place. Run as root, as in the volume's container, it gives the file the
+The script writes a file to a temporary name beside it, which it won't open
+through a symlink, then moves it into place. Run as root, as in the volume's container, it gives the file the
 owner of its directory, and a directory it creates the owner of the
 directory above. A certificate is readable by all, a private key only by its
 owner.
@@ -205,7 +207,11 @@ before a file of that name.
   old certificate still works
 
 Certificates are written beside the agents' keys, as `id_ed25519-cert.pub`
-for `id_ed25519.pub`, here or at their locations.
+for `id_ed25519.pub`, here or at their locations. Here, `ssh-keygen` signs a
+copy of the key in a temporary directory, and lend-ssh writes the
+certificate to a new file of a random name beside the key, which it won't
+open through a symlink, then renames it into place. It refuses a symlink, or
+anything but a file, at the certificate's own name.
 
 ## Install and tab completion
 
