@@ -171,8 +171,9 @@ The certificate:
 - allows a shell and commands only: no port, agent or X11 forwarding.
   `-O permit-port-forwarding` and the like allow them
 
-Grants add up. While the agent's certificate is valid, a new grant keeps the
-accounts it already has, and the later of the two expiry times:
+Grants add up. While the agent's certificate is valid and your CA signed it
+for the agent's key, a new grant keeps the accounts it already has, and the
+later of the two expiry times:
 
 ```
 $ lend-ssh grant -t 30m claude deploy@build

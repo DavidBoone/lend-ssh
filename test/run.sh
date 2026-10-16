@@ -449,6 +449,67 @@ test_revoke() {
   "$lend_ssh" agent rm textual >/dev/null
 }
 
+# An agent that can write its key's directory must not be able to turn a
+# routine grant into a never-expiring certificate, or into a write through a
+# symlink at one of the user's own files.
+# shellcheck disable=SC2016  # bash -c scripts take their own arguments
+test_forged() {
+  local our_fp got princ
+  make_ca
+  keygen "$work/agent"
+  "$lend_ssh" account add -p dave@hosta deploy@hostb >/dev/null
+  our_fp=$(ssh-keygen -lf "$LEND_SSH_CA.pub" | cut -d' ' -f2)
+
+  # The agent plants a certificate signed by a CA of its own, for every
+  # account and with no expiry.
+  keygen "$work/evilca"
+  ssh-keygen -q -s "$work/evilca" -I agent -n dave@hosta,deploy@hostb -V always:forever \
+    "$work/agent.pub"
+  expect "grant ignores a certificate another CA signed" 0 \
+    '^test: dave@hosta \(new\) until [0-9-]' \
+    "$lend_ssh" grant -t 10m "$work/agent" dave@hosta
+  got=$(ssh-keygen -L -f "$work/agent-cert.pub" | sed -n 's/.*Signing CA: [^ ]* \([^ ]*\).*/\1/p')
+  check "... re-signing with our own CA" test "$got" = "$our_fp"
+  princ=$(ssh-keygen -L -f "$work/agent-cert.pub" | sed -n '/Principals:/{n;s/^ *//;p;}')
+  check "... keeping only the account granted" test "$princ" = dave@hosta
+  check "... and giving it an expiry" \
+    bash -c 'ssh-keygen -L -f "$1" | grep -Eq "Valid:.* to "' _ "$work/agent-cert.pub"
+
+  # revoke must not re-sign a foreign certificate either.
+  ssh-keygen -q -s "$work/evilca" -I agent -n dave@hosta,deploy@hostb -V always:forever \
+    "$work/agent.pub"
+  expect "revoke ignores a certificate another CA signed" 0 'no grant to revoke$' \
+    "$lend_ssh" revoke "$work/agent" dave@hosta
+
+  # Nor may it borrow our CA's certificate for another key.
+  keygen "$work/other"
+  "$lend_ssh" grant -t 1h "$work/other" deploy@hostb >/dev/null
+  cp "$work/other-cert.pub" "$work/agent-cert.pub"
+  expect "grant ignores our CA's certificate for another key" 0 \
+    '^test: dave@hosta \(new\) until [0-9-]' \
+    "$lend_ssh" grant -t 10m "$work/agent" dave@hosta
+  princ=$(ssh-keygen -L -f "$work/agent-cert.pub" | sed -n '/Principals:/{n;s/^ *//;p;}')
+  check "... keeping only the account granted" test "$princ" = dave@hosta
+
+  # A symlink planted at the certificate's path must not be followed.
+  rm -f "$work/agent-cert.pub"
+  echo untouched >"$work/victim"
+  ln -s "$work/victim" "$work/agent-cert.pub"
+  expect "grant refuses to write the certificate through a planted symlink" 1 \
+    'refusing to write the certificate through the symlink' \
+    "$lend_ssh" grant -t 10m "$work/agent" dave@hosta
+  check "... leaving the target untouched" test "$(cat "$work/victim")" = untouched
+
+  # Nor may a planted certificate hide a revoked one that still works.
+  rm -f "$work/agent-cert.pub"
+  "$lend_ssh" grant -t 10m "$work/agent" dave@hosta >/dev/null
+  princ=$(ssh-keygen -L -f "$work/agent-cert.pub" | sed -n '/Principals:/{n;s/^ *//;p;}')
+  "$lend_ssh" revoke "$work/agent" >/dev/null
+  ssh-keygen -q -s "$work/evilca" -I agent -n "$princ" -V always:forever "$work/agent.pub"
+  expect "grant lists a revoked account under a certificate another CA signed" 0 \
+    '^test: dave@hosta \(revoked\) until ' "$lend_ssh" grant
+}
+
 # account and account reset, with ~/.ssh/authorized_keys or -k FILE, through an
 # ssh that runs the script here, in a HOME of its own.
 # shellcheck disable=SC2016  # bash -c scripts take their own arguments
@@ -855,6 +916,16 @@ test_locations() {
   check "... and its copy" test ! -e "$kept/c/key-cert.pub"
   "$lend_ssh" grant -t 1h s dave@hosta >/dev/null
   check "grant writes the certificate over ssh" cmp -s "$s/id_ed25519-cert.pub" "$kept/s/key-cert.pub"
+  rm "$s/id_ed25519-cert.pub"
+  mkdir "$work/victim"
+  ln -s "$work/victim" "$s/id_ed25519-cert.pub"
+  expect "grant over ssh refuses a symlink at the certificate's path" 1 \
+    'refusing to write .*/id_ed25519-cert.pub, which is a symlink' \
+    "$lend_ssh" grant -t 1h s dave@hosta
+  check "... writing nothing through it" test -z "$(ls -A "$work/victim")"
+  check "... nor leaving anything beside it" bash -c '! compgen -G "$1/.lend-ssh.*" >/dev/null' _ "$s"
+  rm "$s/id_ed25519-cert.pub"
+  "$lend_ssh" grant -t 1h s dave@hosta >/dev/null
   LEND_SSH_VOLUME_IMAGE=busybox "$lend_ssh" grant -t 1h v dave@hosta >/dev/null
   check "grant writes the certificate in the volume" cmp -s "$v/id_ed25519-cert.pub" "$kept/v/key-cert.pub"
   expect "... from a container of LEND_SSH_VOLUME_IMAGE" 0 ' busybox sh -s$' tail -1 "$fd/log"
@@ -1084,8 +1155,8 @@ test_completion() {
   echo '2 removed' >"$accounts/$me@gw"
   mkdir -p "$HOME/.config/lend-ssh/agents"
   keygen "$work/claude"
-  keygen "$work/ca"
-  ssh-keygen -q -s "$work/ca" -I claude -n "ann@myhost#2,$me@10.0.0.9" -V -5m:+1h "$work/claude.pub"
+  make_ca
+  ssh-keygen -q -s "$LEND_SSH_CA" -I claude -n "ann@myhost#2,$me@10.0.0.9" -V -5m:+1h "$work/claude.pub"
   echo "$work/claude.pub" >"$HOME/.config/lend-ssh/agents/claude"
   echo "$work/codex.pub" >"$HOME/.config/lend-ssh/agents/codex"
   echo "$work/old.pub" >"$HOME/.config/lend-ssh/agents/co.old"
@@ -1655,6 +1726,7 @@ run test_init
 run test_grant
 run test_grant_fg
 run test_revoke
+run test_forged
 run test_ssh_agent
 run test_agents
 run test_locations
