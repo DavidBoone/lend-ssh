@@ -481,6 +481,16 @@ test_forged() {
   expect "revoke ignores a certificate another CA signed" 0 'no grant to revoke$' \
     "$lend_ssh" revoke "$work/agent" dave@hosta
 
+  # Nor may it borrow our CA's certificate for another key.
+  keygen "$work/other"
+  "$lend_ssh" grant -t 1h "$work/other" deploy@hostb >/dev/null
+  cp "$work/other-cert.pub" "$work/agent-cert.pub"
+  expect "grant ignores our CA's certificate for another key" 0 \
+    '^test: dave@hosta \(new\) until [0-9-]' \
+    "$lend_ssh" grant -t 10m "$work/agent" dave@hosta
+  princ=$(ssh-keygen -L -f "$work/agent-cert.pub" | sed -n '/Principals:/{n;s/^ *//;p;}')
+  check "... keeping only the account granted" test "$princ" = dave@hosta
+
   # A symlink planted at the certificate's path must not be followed.
   rm -f "$work/agent-cert.pub"
   echo untouched >"$work/victim"
@@ -906,6 +916,16 @@ test_locations() {
   check "... and its copy" test ! -e "$kept/c/key-cert.pub"
   "$lend_ssh" grant -t 1h s dave@hosta >/dev/null
   check "grant writes the certificate over ssh" cmp -s "$s/id_ed25519-cert.pub" "$kept/s/key-cert.pub"
+  rm "$s/id_ed25519-cert.pub"
+  mkdir "$work/victim"
+  ln -s "$work/victim" "$s/id_ed25519-cert.pub"
+  expect "grant over ssh refuses a symlink at the certificate's path" 1 \
+    'refusing to write .*/id_ed25519-cert.pub, which is a symlink' \
+    "$lend_ssh" grant -t 1h s dave@hosta
+  check "... writing nothing through it" test -z "$(ls -A "$work/victim")"
+  check "... nor leaving anything beside it" bash -c '! compgen -G "$1/.lend-ssh.*" >/dev/null' _ "$s"
+  rm "$s/id_ed25519-cert.pub"
+  "$lend_ssh" grant -t 1h s dave@hosta >/dev/null
   LEND_SSH_VOLUME_IMAGE=busybox "$lend_ssh" grant -t 1h v dave@hosta >/dev/null
   check "grant writes the certificate in the volume" cmp -s "$v/id_ed25519-cert.pub" "$kept/v/key-cert.pub"
   expect "... from a container of LEND_SSH_VOLUME_IMAGE" 0 ' busybox sh -s$' tail -1 "$fd/log"

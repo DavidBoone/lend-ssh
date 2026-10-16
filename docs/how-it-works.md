@@ -60,8 +60,9 @@ A certificate from `grant`:
 
 A grant only adds: while the agent's certificate is valid, the new one keeps
 the accounts it already opens, and its end if that's later. lend-ssh counts
-a certificate as valid only when your CA signed it, so one the agent writes
-itself, signed by another CA, counts as none, everywhere lend-ssh reads one. A grant with other
+a certificate as valid only when your CA signed it for the agent's key, so
+one the agent puts there itself, signed by another CA or for another key,
+counts as none, everywhere lend-ssh reads one. A grant with other
 options than the current certificate's, such as `-O` or `-D`, is refused until
 you `revoke` the agent.
 
@@ -152,8 +153,8 @@ digits and `._@+-/`. `LEND_SSH_VOLUME_IMAGE` sets another image than
 that the volume exists before it runs the container, since `docker run`
 would create one with a mistyped name.
 
-The script writes a file to a temporary name beside it, which it won't open
-through a symlink, then moves it into place. Run as root, as in the volume's container, it gives the file the
+The script writes a file in a new directory of its own beside it, then moves
+it into place; it refuses a symlink, or anything but a file, at the path. Run as root, as in the volume's container, it gives the file the
 owner of its directory, and a directory it creates the owner of the
 directory above. A certificate is readable by all, a private key only by its
 owner.

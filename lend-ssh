@@ -908,8 +908,9 @@ EOF2
 # others, the script prints their names, one per line, and exits 76. It writes into an
 # existing directory, or one it makes in an existing directory, else exits 75.
 # Its files and any directory it makes belong to the owner of the directory
-# they're in. It writes each to a new file, which set -C won't open through a
-# symlink the agent may have put there, and renames that over the path.
+# they're in. It writes each file in a new directory of its own beside the
+# path, which only it can change, then renames it to the path, and exits 77
+# if a symlink, or anything but a file, is there.
 put_script() {
   local i=0
   echo set -e
@@ -927,7 +928,7 @@ put() {
   if [ ! -d "$d" ]; then
     [ -d "$(dirname "$d")" ] || exit 75
     (umask 077 && mkdir "$d")
-    [ "$(id -u)" != 0 ] || chown "$(owner "$(dirname "$d")")" "$d"
+    [ "$(id -u)" != 0 ] || chown -h "$(owner "$(dirname "$d")")" "$d"
   fi
   case $1 in
     *.pub) umask 022 ;;
@@ -937,11 +938,22 @@ put() {
       umask 077
       ;;
   esac
-  t="$1.lend-ssh.$$"
-  trap 'rm -f "$t"' EXIT
-  (set -C && printf '%s\n' "$2" >"$t")
-  [ "$(id -u)" != 0 ] || chown -h "$(owner "$d")" "$t"
-  mv "$t" "$1"
+  t="$d/.lend-ssh.$$"
+  trap 'rm -rf "$t"' EXIT
+  (umask 077 && mkdir "$t")
+  (
+    cd "$t"
+    [ "$(ls -nd . | awk '{ print substr($1, 1, 10) " " $3 }')" = "drwx------ $(id -u)" ] &&
+      [ -z "$(ls -A)" ] || exit 77
+    printf '%s\n' "$2" >f
+    [ "$(id -u)" != 0 ] || chown "$(owner "$d")" f
+    if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then
+      echo "lend-ssh: refusing to write $1, which is a symlink or not a file" >&2
+      exit 77
+    fi
+    mv -f f "$1"
+  )
+  rm -rf "$t"
   trap - EXIT
 }
 i=1
@@ -972,20 +984,25 @@ install_cert() {
   return 1
 }
 
-# Signs public key file $1 with the CA, as ca_signer set ca_args, and
-# ssh-keygen arguments $3..., and puts the certificate at $2 with
-# install_cert. It signs a copy in a directory of its own, as ssh-keygen
-# writes the certificate beside the key, through any symlink there.
+# Signs public key file $1, in a private_dir, with the CA, as ca_signer set
+# ca_args, and ssh-keygen arguments $3..., and puts the certificate at $2
+# with install_cert. ssh-keygen writes the certificate beside the key, through
+# any symlink there, so the key it signs is never in the agent's directory.
 sign_cert() {
-  local pub=$1 cert=$2 dir ok=''
+  local pub=$1 cert=$2
   shift 2
-  dir=$(mktemp -d) || return 1
-  cp "$pub" "$dir/key.pub" &&
-    ssh-keygen -q "${ca_args[@]}" "$@" "$dir/key.pub" >&2 &&
-    install_cert "$dir/key-cert.pub" "$cert" &&
-    ok=1
-  rm -rf "$dir"
-  [[ -n $ok ]]
+  ssh-keygen -q "${ca_args[@]}" "$@" "$pub" >&2 || return
+  [[ ${pub%.pub}-cert.pub == "$cert" ]] || install_cert "${pub%.pub}-cert.pub" "$cert"
+}
+
+# Sets variable $1 to a new private directory, removed when lend-ssh exits.
+scratch=()
+private_dir() {
+  local d
+  d=$(mktemp -d) || die "couldn't make a temporary directory"
+  scratch+=("$d")
+  trap 'rm -rf "${scratch[@]}"' EXIT
+  eval "$1=\$d"
 }
 
 # Writes certificate file $2 to location $1, or with no $2, removes the
@@ -1023,16 +1040,22 @@ deadline_command() {
 # Reads certificate file $1 into c_principals, c_end (YYYYMMDDHHMMSS, empty
 # for none), c_id, c_exts, c_crit (other critical options as ssh-keygen -O
 # takes them) and c_deadline (the epoch of lend-ssh's session deadline, if it
-# has one). Fails if there's no readable certificate.
+# has one), and c_ca_ok (1 when our CA signed it, for public key file $2,
+# else the .pub beside it). Fails if there's no readable certificate.
 cert_info() {
-  local info tag value name signer
+  local info tag value name signer subject
   c_principals=() c_exts=() c_crit=() c_end='' c_id='' c_deadline='' c_ca_ok=''
   [[ -f $1 ]] && info=$(ssh-keygen -L -f "$1" 2>/dev/null) || return 1
   # An agent that can write its key's directory can plant a certificate signed
-  # by a CA of its own, so cert_valid holds only for one our CA signed.
+  # by a CA of its own, or our CA's certificate for another key, so cert_valid
+  # holds only for one our CA signed for this key.
   signer=$(sed -n 's/^        Signing CA: [^ ]* \([^ ]*\).*/\1/p' <<<"$info")
+  subject=$(sed -n 's/^        Public key: [^ ]* \([^ ]*\)$/\1/p' <<<"$info")
   [[ -n $ca_fp ]] || ca_fp=$(ssh-keygen -lf "$ca.pub" 2>/dev/null | cut -d' ' -f2) || true
-  [[ -z $signer || $signer != "$ca_fp" ]] || c_ca_ok=1
+  if [[ -n $signer && $signer == "$ca_fp" && -n $subject &&
+    $subject == "$(ssh-keygen -lf "${2:-${1%-cert.pub}.pub}" 2>/dev/null | cut -d' ' -f2)" ]]; then
+    c_ca_ok=1
+  fi
   while IFS= read -r line; do
     tag=${line%% *} value=${line#* }
     case $tag in
@@ -1198,9 +1221,7 @@ cmd_grant() {
   done
 
   if [[ $key == - || ( ! -e $key && ! -e $key.pub ) ]]; then
-    tmp=$(mktemp -d)
-    # shellcheck disable=SC2064  # expand $tmp now
-    trap "rm -rf '$tmp'" EXIT
+    private_dir tmp
     pub=$tmp/key.pub
     if [[ $key == - ]]; then
       cat >"$pub"
@@ -1209,8 +1230,14 @@ cmd_grant() {
     fi
     cert=$tmp/key-cert.pub
   else
+    # The key is read once, into a copy that the certificate beside it must
+    # be for and that grant signs: the agent may change the files there.
     pub=$(pubkey_of "$key")
     cert=${pub%.pub}-cert.pub
+    local snap
+    private_dir snap
+    cp "$pub" "$snap/key.pub"
+    pub=$snap/key.pub
   fi
   # A key given for no agent is logged under its comment.
   [[ -n $id ]] || id=$(cut -d' ' -f3- "$pub" | head -1)
@@ -1221,7 +1248,7 @@ cmd_grant() {
   end=$now_end
   # A grant only adds: while the key's certificate is valid, the new one
   # keeps its accounts that are still open and its end, if later.
-  if [[ -z $tmp ]] && cert_info "$cert" && cert_valid; then
+  if [[ -z $tmp ]] && cert_info "$cert" "$pub" && cert_valid; then
     local had want
     had=$(option_words)
     want=$(expected_words "${key_opts[@]}")
@@ -1302,7 +1329,10 @@ cmd_revoke() {
     die "$1's certificate isn't kept here, so it can't be narrowed; '$prog account reset [USER@]HOST' cancels it"
   cert=$(pubkey_of "$key")
   cert=${cert%.pub}-cert.pub
-  if ! cert_info "$cert" || ! cert_valid; then
+  local snap
+  private_dir snap
+  cp "$(pubkey_of "$key")" "$snap/key.pub"
+  if ! cert_info "$cert" "$snap/key.pub" || ! cert_valid; then
     echo "$1: no grant to revoke"
     return
   fi
@@ -1336,7 +1366,7 @@ cmd_revoke() {
     for p in ${c_exts[@]+"${c_exts[@]}"}; do args+=(-O "$p"); done
     for p in ${c_crit[@]+"${c_crit[@]}"}; do args+=(-O "$p"); done
     [[ -z $c_deadline ]] || args+=(-O "force-command=$(deadline_command "$c_deadline" "${keep[@]}")")
-    sign_cert "$(pubkey_of "$key")" "$cert" -I "$c_id" -n "$(IFS=,; echo "${keep[*]}")" \
+    sign_cert "$snap/key.pub" "$cert" -I "$c_id" -n "$(IFS=,; echo "${keep[*]}")" \
       -V "-5m:${c_end:-forever}" "${args[@]}" ||
       die "couldn't write $c_id's certificate to $(tildify "$cert"); revoke again to retry"
   fi
