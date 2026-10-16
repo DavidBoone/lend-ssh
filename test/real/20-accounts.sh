@@ -50,13 +50,13 @@ real_accounts_grant_revoke() {
   expect "... and deploy@host1" 0 '^deploy@host1' "$lend_ssh" account
   expect "accounts: agent add creates a key at agentbox" 0 '^added agent acct: ' "$lend_ssh" agent add acct ssh://agent@agentbox/~/acct/id_ed25519.pub
 
-  expect "accounts: grant to two accounts" 0 '^acct: (dave@host1 \(new\), deploy@host1 \(new\)|deploy@host1 \(new\), dave@host1 \(new\))' \
+  expect "accounts: grant to two accounts" 0 '^acct: deploy@host1 \(new\) until ' \
     "$lend_ssh" grant -t 1h acct dave@host1 deploy@host1
   expect "accounts: the agent logs in to dave" 0 '^dave$' agent_ssh -i /home/agent/acct/id_ed25519 agentbox dave whoami
   expect "accounts: the agent logs in to deploy" 0 '^deploy$' agent_ssh -i /home/agent/acct/id_ed25519 agentbox deploy whoami
   check "accounts: account lists the agent under dave" listed dave@host1 'acct until '
   check "accounts: account lists the agent under deploy" listed deploy@host1 'acct until '
-  expect "accounts: revoke one account" 0 '^acct: revoked deploy@host1; keeps dave@host1' "$lend_ssh" revoke acct deploy@host1
+  expect "accounts: revoke one account" 0 '^acct: deploy@host1 \(revoked\) until ' "$lend_ssh" revoke acct deploy@host1
   expect "accounts: the agent can't log in to deploy" fail 'Permission denied' agent_ssh -i /home/agent/acct/id_ed25519 agentbox deploy whoami
   expect "accounts: the agent still logs in to dave" 0 '^dave$' agent_ssh -i /home/agent/acct/id_ed25519 agentbox dave whoami
   expect "accounts: grant lists deploy as revoked" 0 '^acct: .*deploy@host1 \(revoked\)' "$lend_ssh" grant
@@ -85,7 +85,7 @@ real_accounts_reset() {
   "$lend_ssh" grant -t 1h acct dave@host1 >/dev/null
   as_agent agentbox sh -c 'mkdir ~/acct-copy && cp ~/acct/id_ed25519 ~/acct/id_ed25519-cert.pub ~/acct-copy/'
   expect "accounts: reset: the copy logs in" 0 '^dave$' agent_ssh -i /home/agent/acct-copy/id_ed25519 agentbox dave whoami
-  expect "accounts: reset: revoke" 0 "^acct: revoked dave@host1; .*account reset dave@host1" "$lend_ssh" revoke acct
+  expect "accounts: reset: revoke" 0 "^acct: a copy .*account reset dave@host1" "$lend_ssh" revoke acct
   expect "accounts: reset: the agent can't log in after revoke" fail 'Permission denied' agent_ssh -i /home/agent/acct/id_ed25519 agentbox dave whoami
   expect "accounts: reset: the copy still logs in after revoke" 0 '^dave$' agent_ssh -i /home/agent/acct-copy/id_ed25519 agentbox dave whoami
   expect "accounts: reset: account lists dave as revoked" 0 'acct .*revoked' "$lend_ssh" account
@@ -151,7 +151,7 @@ real_accounts_text() {
   docker exec -i -u agent "$id-agentbox" sh -c 'cat >~/acct/id_ed25519-cert.pub' <grant.out
   expect "accounts: text: the agent logs in" 0 '^dave$' agent_ssh -i /home/agent/acct/id_ed25519 agentbox dave whoami
   expect "accounts: text: agent lists the grant" 0 'dave@host1 until ' "$lend_ssh" agent
-  expect "accounts: text: revoke" 0 '^txt: revoked dave@host1; a copy' "$lend_ssh" revoke txt
+  expect "accounts: text: revoke" 0 '^txt: a copy' "$lend_ssh" revoke txt
   "$lend_ssh" agent rm txt >/dev/null
 
   # README's pipeline: the key from stdin, the certificate to the agent.

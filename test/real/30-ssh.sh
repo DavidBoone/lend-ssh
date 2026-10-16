@@ -58,15 +58,15 @@ real_ssh_existing_key() {
     cmp -s "$XDG_CONFIG_HOME/lend-ssh/keys/box/key.pub" <(box_exec cat /home/agent/have/id_ed25519.pub)
   "$lend_ssh" account add dave@host1 deploy@host1 >/dev/null
   expect "ssh: grant at a location" 0 '^box: dave@host1 \(new\)' "$lend_ssh" grant -t 1h box dave@host1
-  expect "ssh: grant adds at a location" 0 '^box: deploy@host1 \(new\), dave@host1 \(kept\)' "$lend_ssh" grant -t 1h box deploy@host1
+  expect "ssh: grant adds at a location" 0 '^box: dave@host1 \(kept\) until ' "$lend_ssh" grant -t 1h box deploy@host1
   expect "... the agent still logs in to the account it had" 0 '^dave$' agent_ssh -i /home/agent/have/id_ed25519 agentbox dave whoami
   expect "... and to the new one" 0 '^deploy$' agent_ssh -i /home/agent/have/id_ed25519 agentbox deploy whoami
-  expect "ssh: revoke narrows at a location" 0 '^box: revoked deploy@host1; keeps dave@host1' "$lend_ssh" revoke box deploy@host1
+  expect "ssh: revoke narrows at a location" 0 '^box: deploy@host1 \(revoked\) until ' "$lend_ssh" revoke box deploy@host1
   expect "... the agent can't log in to the account revoked" fail 'Permission denied' agent_ssh -i /home/agent/have/id_ed25519 agentbox deploy whoami
   expect "... and still logs in to the one kept" 0 '^dave$' agent_ssh -i /home/agent/have/id_ed25519 agentbox dave whoami
   check "ssh: revoke narrows the certificate there" \
     cmp -s "$XDG_CONFIG_HOME/lend-ssh/keys/box/key-cert.pub" <(box_exec cat /home/agent/have/id_ed25519-cert.pub)
-  expect "ssh: revoke removes the certificate at a location" 0 '^box: revoked dave@host1' "$lend_ssh" revoke box
+  expect "ssh: revoke removes the certificate at a location" 0 '^box: dave@host1 \(revoked\) until ' "$lend_ssh" revoke box
   expect "ssh: revoke removes the certificate there" fail 'No such file' box_exec ls /home/agent/have/id_ed25519-cert.pub
   expect "ssh: revoke leaves the key there" 0 '^agent 600 agent 644$' \
     box_stat /home/agent/have/id_ed25519 /home/agent/have/id_ed25519.pub
@@ -168,7 +168,7 @@ real_ssh_bare_host() {
   expect "... removes the certificate there" fail 'No such file' box_exec ls /home/agent/.ssh/id_ed25519-cert.pub
   expect "ssh: grant to a Host in ~/.ssh/config" 0 '^box3: dave@host1 \(new\)' "$lend_ssh" grant -t 1h box3 dave@host1
   expect "... the agent logs in" 0 '^dave$' agent_ssh agentbox dave whoami
-  expect "ssh: revoke at a Host in ~/.ssh/config" 0 '^box3: revoked dave@host1' "$lend_ssh" revoke box3
+  expect "ssh: revoke at a Host in ~/.ssh/config" 0 '^box3: dave@host1 \(revoked\) until ' "$lend_ssh" revoke box3
   expect "... removes the certificate there" fail 'No such file' box_exec ls /home/agent/.ssh/id_ed25519-cert.pub
   "$lend_ssh" agent rm box2 box3 >/dev/null
   "$lend_ssh" account rm dave@host1 >/dev/null
@@ -215,7 +215,7 @@ real_ssh_unreachable() {
   box_on
   check "ssh: agentbox is back on the network under its names" test "$(box_aliases)" = "$aliases"
   expect "ssh: the agent can't log in to an account granted while unreachable" fail 'Permission denied' agent_ssh -i /home/agent/gone/id_ed25519 agentbox deploy whoami
-  expect "ssh: granting again after it's reachable" 0 '^box: deploy@host1 \(new\), dave@host1 \(kept\)' "$lend_ssh" grant -t 1h box deploy@host1
+  expect "ssh: granting again after it's reachable" 0 '^box: dave@host1 \(kept\) until ' "$lend_ssh" grant -t 1h box deploy@host1
   expect "... the agent logs in" 0 '^deploy$' agent_ssh -i /home/agent/gone/id_ed25519 agentbox deploy whoami
 
   box_off
@@ -225,7 +225,7 @@ real_ssh_unreachable() {
   expect "ssh: revoke at an unreachable location keeps the grant" 0 'deploy@host1' "$lend_ssh" grant
   box_on
   expect "... the agent still logs in" 0 '^deploy$' agent_ssh -i /home/agent/gone/id_ed25519 agentbox deploy whoami
-  expect "ssh: revoking again after it's reachable" 0 '^box: revoked deploy@host1; keeps dave@host1' "$lend_ssh" revoke box deploy@host1
+  expect "ssh: revoking again after it's reachable" 0 '^box: deploy@host1 \(revoked\) until ' "$lend_ssh" revoke box deploy@host1
   expect "... the agent can't log in" fail 'Permission denied' agent_ssh -i /home/agent/gone/id_ed25519 agentbox deploy whoami
 
   box_off

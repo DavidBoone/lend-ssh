@@ -45,17 +45,17 @@ real_docker_container() {
     '^agent 700 /home/agent/.ssh agent 600 /home/agent/.ssh/id_ed25519 agent 644 /home/agent/.ssh/id_ed25519.pub $' \
     oneline docker_files agentc /home/agent/.ssh /home/agent/.ssh/id_ed25519 /home/agent/.ssh/id_ed25519.pub
   expect "... agent lists it at its location" 0 "^c	$loc$" "$lend_ssh" agent
-  expect "docker: grant to an agent in a container" 0 '^c: dave@host1 \(new\), deploy@host1 \(new\) until ' \
+  expect "docker: grant to an agent in a container" 0 '^c: deploy@host1 \(new\) until ' \
     "$lend_ssh" grant -t 1h c dave@host1 deploy@host1
   expect "... writes the certificate there, the agent's" 0 '^agent 644 /home/agent/.ssh/id_ed25519-cert.pub$' \
     docker_files agentc /home/agent/.ssh/id_ed25519-cert.pub
   expect "... the agent logs in from the container" 0 '^dave$' agent_ssh agentc dave whoami
   expect "... to both accounts" 0 '^deploy$' agent_ssh agentc deploy whoami
-  expect "docker: revoke narrows the certificate in the container" 0 '^c: revoked deploy@host1; keeps dave@host1' \
+  expect "docker: revoke narrows the certificate in the container" 0 '^c: deploy@host1 \(revoked\) until ' \
     "$lend_ssh" revoke c deploy@host1
   expect "... the agent can't log in to the account revoked" fail 'Permission denied' agent_ssh agentc deploy whoami
   expect "... and still logs in to the other" 0 '^dave$' agent_ssh agentc dave whoami
-  expect "docker: revoke removes the certificate in the container" 0 '^c: revoked dave@host1' "$lend_ssh" revoke c
+  expect "docker: revoke removes the certificate in the container" 0 '^c: dave@host1 \(revoked\) until ' "$lend_ssh" revoke c
   expect "... it's gone there" fail 'No such file' docker_files agentc /home/agent/.ssh/id_ed25519-cert.pub
   expect "... the agent can't log in" fail 'Permission denied' agent_ssh agentc dave whoami
   expect "docker: agent add of a key already in a container" 0 "^added agent c2: $loc$" "$lend_ssh" agent add c2 "$loc"
@@ -82,7 +82,7 @@ docker_volume_add() {
   expect "... writes the certificate there, owned alike" 0 '^agent 644 /home/agent/.ssh/id_ed25519-cert.pub$' \
     docker_files volume /home/agent/.ssh/id_ed25519-cert.pub
   expect "... the agent logs in with the volume as its home" 0 '^dave$' agent_ssh volume dave whoami
-  expect "... revoke removes it there" 0 "^$name: revoked dave@host1" "$lend_ssh" revoke "$name"
+  expect "... revoke removes it there" 0 "^$name: dave@host1 \(revoked\) until " "$lend_ssh" revoke "$name"
   expect "... the agent can't log in" fail 'Permission denied' agent_ssh volume dave whoami
   expect "... lend-ssh's containers are gone" 0 '^$' volume_containers
   "$lend_ssh" agent rm "$name" >/dev/null
@@ -128,7 +128,7 @@ real_docker_stopped() {
   expect "... revokes nothing" 0 '^c: dave@host1 until ' "$lend_ssh" grant
   docker start "$id-agentc" >/dev/null
   expect "... the agent still logs in" 0 '^dave$' agent_ssh agentc dave whoami
-  expect "... revoking again retries" 0 '^c: revoked dave@host1' "$lend_ssh" revoke c
+  expect "... revoking again retries" 0 '^c: dave@host1 \(revoked\) until ' "$lend_ssh" revoke c
   expect "... the agent can't log in" fail 'Permission denied' agent_ssh agentc dave whoami
   "$lend_ssh" agent rm c >/dev/null
   docker_reset
@@ -150,7 +150,7 @@ real_docker_move() {
   expect "... the certificate is gone from the container" fail 'No such file' \
     docker_files agentc /home/agent/.ssh/id_ed25519-cert.pub
   expect "... the agent can't log in from it" fail 'Permission denied' agent_ssh agentc dave whoami
-  expect "... revoke removes it in the volume" 0 '^c: revoked dave@host1' "$lend_ssh" revoke c
+  expect "... revoke removes it in the volume" 0 '^c: dave@host1 \(revoked\) until ' "$lend_ssh" revoke c
   expect "... the agent can't log in" fail 'Permission denied' agent_ssh volume dave whoami
   "$lend_ssh" agent rm c >/dev/null
   docker_reset
