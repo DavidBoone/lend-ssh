@@ -193,6 +193,7 @@ PY
 # A security key can't be had here, so a fake ssh-keygen stands in for one:
 # it logs its arguments, and makes an ed25519-sk key as a plain ed25519 one,
 # or fails as with no security key plugged in when $work/no-key exists.
+# shellcheck disable=SC2016  # bash -c scripts take their own arguments
 test_init_security_key() {
   local real
   real=$(command -v ssh-keygen)
@@ -222,6 +223,24 @@ EOF
   touch "$work/no-key"
   expect "init -s without a security key" 1 'device not found.*is one plugged in' \
     bash -c '"$@" 2>&1 | tr "\n" " "; exit "${PIPESTATUS[0]}"' _ "$lend_ssh" init -s
+  rm "$work/no-key"
+
+  # grant signs with a security key's handle even when ssh-agent has the key.
+  # The fake's key is a plain one, so its public key is given the sk type.
+  "$lend_ssh" init -s >/dev/null
+  "$lend_ssh" account add -p dave@hosta >/dev/null 2>&1
+  keygen "$work/a"
+  eval "$(ssh-agent -s -a "/tmp/lend-ssh-test-$$-agent")" >/dev/null
+  ssh-add -q "$LEND_SSH_CA" 2>/dev/null
+  sed 's/^[^ ]*/sk-ssh-ed25519@openssh.com/' "$LEND_SSH_CA.pub" >"$work/sk.pub"
+  mv "$work/sk.pub" "$LEND_SSH_CA.pub"
+  : >"$work/keygen.log"
+  expect "grant with a security key's CA" 0 'dave@hosta \(new\)' "$lend_ssh" grant -t 1h "$work/a" dave@hosta
+  expect "... signs with its handle, not through ssh-agent" 0 "^-q -s $LEND_SSH_CA -I " \
+    grep -- '-I ' "$work/keygen.log"
+  ssh-agent -k >/dev/null
+  unset SSH_AUTH_SOCK SSH_AGENT_PID
+  rm -rf "${LEND_SSH_CA%/*}"
 }
 
 # account add with a security key's CA warns of a host too old for it. A fake

@@ -493,10 +493,14 @@ ca_blob() {
 # Signing CA, once cert_info has read it.
 ca_fp=''
 
-# Sets ca_args to ssh-keygen's arguments for signing with the CA: its copy in
-# your ssh-agent if it has one, else its private key file.
+# Sets ca_args to ssh-keygen's arguments for signing with the CA: for a
+# security key's CA, its handle when there is one, as ssh-agent would ask for
+# the PIN through askpass rather than on the terminal; else its copy in your
+# ssh-agent if it has one, else its private key file.
 ca_signer() {
-  if grep -qF " $(ca_blob)" <<<"$(ssh-add -L 2>/dev/null)"; then
+  if [[ -f $ca && $(cut -d' ' -f1 "$ca.pub") == sk-* ]]; then
+    ca_args=(-s "$ca")
+  elif grep -qF " $(ca_blob)" <<<"$(ssh-add -L 2>/dev/null)"; then
     ca_args=(-s "$ca.pub" -U)
   else
     [[ -f $ca ]] || die "the signing key isn't at $ca or in your ssh-agent"

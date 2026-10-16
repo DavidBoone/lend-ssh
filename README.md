@@ -343,6 +343,10 @@ ssh-add -t 8h ~/.config/lend-ssh/ca
 use your ssh-agent can sign certificates with it, including a host you
 `ssh -A` into.
 
+A signing key on a security key (`init -s`) has no passphrase, and `grant`
+and `revoke` sign with its handle, `~/.config/lend-ssh/ca`, even when it's
+in your ssh-agent.
+
 ### With clod
 
 In a [clod](https://github.com/DavidBoone/clod) container whose home is a
