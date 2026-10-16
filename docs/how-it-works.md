@@ -153,7 +153,7 @@ digits and `._@+-/`. `LEND_SSH_VOLUME_IMAGE` sets another image than
 that the volume exists before it runs the container, since `docker run`
 would create one with a mistyped name.
 
-The script writes a file in a new directory of its own beside it, then moves
+The script writes a file in a new directory of its own beside it, then links
 it into place; it refuses a symlink, or anything but a file, at the path. Run as root, as in the volume's container, it gives the file the
 owner of its directory, and a directory it creates the owner of the
 directory above. A certificate is readable by all, a private key only by its
@@ -210,8 +210,8 @@ before a file of that name.
 Certificates are written beside the agents' keys, as `id_ed25519-cert.pub`
 for `id_ed25519.pub`, here or at their locations. Here, `ssh-keygen` signs a
 copy of the key in a temporary directory, and lend-ssh writes the
-certificate to a new file of a random name beside the key, which it won't
-open through a symlink, then renames it into place. It refuses a symlink, or
+certificate in a new directory of its own beside the key, then links it into
+place. It refuses a symlink, or
 anything but a file, at the certificate's own name.
 
 ## Install and tab completion

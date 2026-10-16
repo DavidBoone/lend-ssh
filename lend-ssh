@@ -909,8 +909,9 @@ EOF2
 # existing directory, or one it makes in an existing directory, else exits 75.
 # Its files and any directory it makes belong to the owner of the directory
 # they're in. It writes each file in a new directory of its own beside the
-# path, which only it can change, then renames it to the path, and exits 77
-# if a symlink, or anything but a file, is there.
+# path, which only it can change, then links it to the path with ln -n, which
+# replaces a symlink there rather than following it; it exits 77 if a
+# symlink, or anything but a file, is there beforehand.
 put_script() {
   local i=0
   echo set -e
@@ -946,12 +947,12 @@ put() {
     [ "$(ls -nd . | awk '{ print substr($1, 1, 10) " " $3 }')" = "drwx------ $(id -u)" ] &&
       [ -z "$(ls -A)" ] || exit 77
     printf '%s\n' "$2" >f
-    [ "$(id -u)" != 0 ] || chown "$(owner "$d")" f
+    [ "$(id -u)" != 0 ] || chown -h "$(owner "$d")" f
     if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then
       echo "lend-ssh: refusing to write $1, which is a symlink or not a file" >&2
       exit 77
     fi
-    mv -f f "$1"
+    ln -nf f "$1"
   )
   rm -rf "$t"
   trap - EXIT
@@ -964,24 +965,26 @@ done
 EOF2
 }
 
-# Puts certificate file $1 at path $2, beside the agent's key, in a directory
-# the agent may be able to write. It refuses a symlink or anything but a
-# regular file at $2. It writes a new file of a random name, which set -C
-# won't open through a symlink planted there meanwhile, and renames it to $2,
-# which replaces whatever is there then without writing into it.
+# Puts certificate file $1 (an absolute path) at path $2, beside the agent's
+# key, in a directory the agent may be able to write. It refuses a symlink or
+# anything but a regular file at $2. It writes the certificate in a new
+# directory of its own beside $2, checked to be its own and empty once it is
+# in it, then links it to $2 with ln -n, which replaces whatever is there
+# then, a symlink included, without writing through it.
 install_cert() {
-  local dir=${2%/*} t
-  [[ $dir != "$2" ]] || dir=.
-  [[ ! -L $2 ]] ||
+  local dest=$2 t ok=''
+  [[ $dest == /* ]] || dest=$PWD/$dest
+  [[ ! -L $dest ]] ||
     { echo "$prog: refusing to write the certificate through the symlink $2" >&2; return 1; }
-  [[ ! -e $2 || -f $2 ]] ||
+  [[ ! -e $dest || -f $dest ]] ||
     { echo "$prog: $2 isn't a regular file" >&2; return 1; }
-  t=$(mktemp -u "$dir/.lend-ssh-cert.XXXXXX") || return 1
-  if (set -C && umask 022 && cat "$1" >"$t") && mv -f "$t" "$2"; then
-    return 0
-  fi
-  rm -f "$t"
-  return 1
+  t=$(mktemp -d "${dest%/*}/.lend-ssh.XXXXXX") || return 1
+  (
+    cd "$t" && [[ -O . && -z $(ls -A) ]] &&
+      umask 022 && cat "$1" >f && ln -nf f "$dest"
+  ) && ok=1
+  rm -rf "$t"
+  [[ -n $ok ]]
 }
 
 # Signs public key file $1, in a private_dir, with the CA, as ca_signer set
