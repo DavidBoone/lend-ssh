@@ -29,6 +29,15 @@ sshd it is only a label, matched against the certificate.
 Two hand-edited lines with the same name are opened by the same
 certificates.
 
+An account pattern for `grant`, `revoke` or `account` matches these names,
+not what you typed for `account add`: `'web*'` matches the `HostName`, for
+any user, and `'deploy@web*'` the whole name. `grant` matches the accounts set
+up and not removed, `revoke` those in the agent's certificate, and `account`
+every account it lists, removed ones included. Each account counts once,
+however many arguments match it, and a pattern that matches none fails the
+command. `grant -F` revokes, on Ctrl+C, the accounts its arguments named
+when it started.
+
 ### Account numbers
 
 Each account set up from here has a number, kept in

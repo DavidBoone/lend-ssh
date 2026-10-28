@@ -40,7 +40,7 @@ Day to day
 grant|;-t TIME [-O OPTION]... [-I ID] [-D] AGENT [USER@]HOST...|list the grants, or let AGENT into these accounts for a while
 revoke|AGENT [USER@]HOST...|take these accounts back from AGENT
 agent||list the agents, and what they can reach until when
-account||list the accounts, and which agents can reach them until when
+account|[[USER@]HOST...]|list the accounts, and which agents can reach them until when
 agent show|AGENT|show AGENT's certificate in detail
 Cut off
 account reset|[-k FILE] [USER@]HOST...|cancel every agent's grants to these accounts
@@ -111,8 +111,11 @@ EOF2
     account)
       cat <<'EOF2'
 Lists the accounts set up from here, which agents can reach each, and until
-when. The account commands log in to the account over ssh; every other
-command only changes things on this machine.
+when. With accounts named, it lists only those, and patterns match as they do
+for grant, so it shows what a grant to them would give, except that grant's
+patterns skip accounts listed as removed. An account not set up, or a pattern
+that matches none, fails. The account commands log in to the account over
+ssh; every other command only changes things on this machine.
 EOF2
       ;;
     'agent add')
@@ -186,6 +189,11 @@ Each account must be set up with 'account add'; in a terminal, grant offers to
 run it for those that aren't. When the certificate expires, the agent's
 sessions end and it can't log in again.
 
+An account holding *, ? or [ is a pattern (quote it) for every account set up
+from here that it matches: 'deploy@web*' matches each host starting web for
+deploy, and 'web*' for any user. A pattern that matches none fails the grant.
+'account PATTERN' lists what it matches.
+
 Granting again while AGENT's certificate is valid adds to it: AGENT keeps the
 accounts it has, and the later of the two expiry times. To change -O or -D,
 revoke AGENT first.
@@ -199,15 +207,17 @@ ssh-keygen -O option.
 
 With -F, grant stays in the foreground until the certificate expires and then
 says so. If you press Ctrl+C before, it revokes the accounts it granted, as
-'revoke AGENT [USER@]HOST...' does. -F needs an agent whose certificate is
-kept here, so not a public key or -.
+'revoke AGENT [USER@]HOST...' does; for a pattern, the accounts it matched
+then. -F needs an agent whose certificate is kept here, so not a public key
+or -.
 EOF2
       ;;
     revoke)
       cat <<'EOF2'
 Takes these accounts out of AGENT's certificate, or with none named, removes
 the certificate. Sessions AGENT has open run on until the certificate would
-have expired.
+have expired. An account pattern, as grant takes, matches AGENT's accounts,
+and one that matches none fails the revoke.
 
 revoke changes only the certificate where grant wrote it, and for an agent
 given as text, prints the new one, if any. When it can't change it at an
@@ -429,7 +439,7 @@ command_help() {
   [[ -n $line ]] || usage_error "no command '$key'"
   IFS='|' read -r name args desc <<<"$line"
   if is_noun "$key"; then
-    echo "$lead $prog $key"
+    echo "$lead $prog $key${args:+ $args}"
     echo "   or: $prog $key COMMAND [ARGS]"
   elif [[ -z $args ]]; then
     echo "$lead $prog $key"
@@ -498,19 +508,51 @@ ca_signer() {
   fi
 }
 
+# True when [USER@]HOST $1 is an account pattern: it holds *, ? or [.
+is_pattern() {
+  [[ $1 == *[*?[]* ]]
+}
+
+# True when account name USER@HOST $2 matches pattern $1: the whole name, or
+# without USER@, the HOST of any user.
+account_matches() {
+  # shellcheck disable=SC2053  # $1 is a pattern
+  if [[ $1 == *@* ]]; then [[ $2 == $1 ]]; else [[ ${2#*@} == $1 ]]; fi
+}
+
 # Sets dests to the accounts [USER@]HOST as given, and names to their
-# USER@HOST names: the user and host name ssh -G gives for each.
+# USER@HOST names: the user and host name ssh -G gives for each, or with
+# $names_given set, the name as given; once each. A [USER@]HOST holding *, ?
+# or [ is a pattern, which stands for the accounts among those named in lines
+# $pool it matches, as their names. $pool_of says where they are from; unset,
+# there are no patterns.
 resolve_accounts() {
-  local t name
+  local t name found pat
+  local -a found_names
   [[ $# -gt 0 ]] || usage_error "name at least one [USER@]HOST"
   dests=() names=()
   for t in "$@"; do
     [[ $t != -* ]] || usage_error "'$t' isn't [USER@]HOST"
-    name=$(account_name "$t") || die "ssh -G can't read the ssh config for '$t'"
-    [[ $name =~ $name_re ]] ||
-      die "'$t' is '$name', which can't be a name (letters, digits, '.', '_', '-' and ':')"
-    dests+=("$t")
-    names+=("$name")
+    found_names=() pat=''
+    [[ -z ${pool_of-} ]] || ! is_pattern "$t" || pat=1
+    if [[ -n $pat ]]; then
+      while IFS= read -r name; do
+        [[ -n $name ]] && account_matches "$t" "$name" && found_names+=("$name")
+      done <<<"${pool-}"
+      [[ ${#found_names[@]} -gt 0 ]] || die "'$t' matches none of $pool_of"
+    elif [[ -n ${names_given-} ]]; then
+      found_names=("$t")
+    else
+      name=$(account_name "$t") || die "ssh -G can't read the ssh config for '$t'"
+      [[ $name =~ $name_re ]] ||
+        die "'$t' is '$name', which can't be a name (letters, digits, '.', '_', '-' and ':')"
+      found_names=("$name")
+    fi
+    for found in "${found_names[@]}"; do
+      [[ " ${names[*]-} " != *" $found "* ]] || continue
+      if [[ -n $pat ]]; then dests+=("$found"); else dests+=("$t"); fi
+      names+=("$found")
+    done
   done
 }
 
@@ -679,13 +721,24 @@ cmd_account_rm() {
 }
 
 cmd_account() {
-  [[ $# -eq 0 ]] || usage_error "unknown account command '$1' ($(verbs account), or none to list)"
-  local f name n state found='' p who live
+  local f name n state found='' p who live i pool pool_of='the accounts set up from here'
+  local -a dests names
+  pool=$(recorded_accounts)
+  if [[ $# -gt 0 ]]; then
+    resolve_accounts "$@"
+    for ((i = 0; i < ${#names[@]}; i++)); do
+      [[ $'\n'$pool$'\n' != *$'\n'${names[i]}$'\n'* ]] || continue
+      [[ ${dests[i]} == *@* ]] ||
+        usage_error "'${dests[i]}' is neither an account command ($(verbs account)) nor an account set up from here"
+      die "'${dests[i]}' isn't an account set up from here"
+    done
+  fi
   live=$(live_revoked)
-  for f in "$accounts"/*; do
-    [[ -f $f ]] || continue
+  while IFS= read -r name; do
+    [[ -n $name ]] || continue
+    [[ $# -eq 0 || " ${names[*]} " == *" $name "* ]] || continue
+    f=$accounts/$name
     found=1
-    name=${f##*/}
     n=0 state=''
     read -r n state <"$f" || true
     if [[ $state == removed ]]; then
@@ -700,7 +753,7 @@ cmd_account() {
     else
       printf '%s\n\t%s\n' "$name" "no agent"
     fi
-  done
+  done <<<"$pool"
   [[ -n $found ]] || echo "No accounts. '$prog account add [USER@]HOST' sets one up."
 }
 
@@ -1207,11 +1260,14 @@ cmd_grant() {
   ! is_agent "$1" || read_agent "$1"
   [[ -n $id || $key == "$1" ]] || id=$1
   shift
-  local -a hosts=("$@")
   if [[ -n $fg && ( $key == - || ( ! -e $key && ! -e $key.pub ) ) ]]; then
     usage_error "-F needs an agent whose certificate is kept here, not a public key or -"
   fi
+  local pool pool_of='the accounts set up from here'
+  pool=$(open_accounts)
   resolve_accounts "$@"
+  # -F's revoke takes back the accounts these name now.
+  local -a hosts=("${names[@]}")
   [[ $time =~ ^([0-9]+[smhdwSMHDW]?)+$ ]] || usage_error "bad time '$time': use 30m, 4h, 1h30m, 2d"
   secs=$(seconds "$time")
   if [[ -n $deadline && " ${key_opts[*]} " == *" force-command="* ]]; then
@@ -1295,7 +1351,8 @@ cmd_grant() {
 
 # For grant -F: waits until certificate end $1 (YYYYMMDDHHMMSS, empty for
 # none), then says $2's grant has expired. On Ctrl+C or SIGTERM before, it
-# revokes agent $3's grant to accounts $4..., as the revoke command does.
+# revokes agent $3's grant to accounts named $4..., as the revoke command
+# does.
 hold_grant() {
   local end=$1 id=$2
   shift 2
@@ -1315,6 +1372,7 @@ hold_grant() {
 
 # What grant -F does on Ctrl+C: revokes agent $1's grant to accounts $2....
 grant_interrupted() {
+  local names_given=1
   trap '' INT TERM
   echo >&2
   opts=()
@@ -1336,6 +1394,9 @@ cmd_revoke() {
   private_dir snap
   cp "$(pubkey_of "$key")" "$snap/key.pub"
   if ! cert_info "$cert" "$snap/key.pub" || ! cert_valid; then
+    for p in "${@:2}"; do
+      ! is_pattern "$p" || die "'$p' matches none of $1's accounts"
+    done
     echo "$1: no grant to revoke"
     return
   fi
@@ -1343,6 +1404,8 @@ cmd_revoke() {
   [[ $key == "$1" ]] || name=$1
   shift
   if [[ $# -gt 0 ]]; then
+    local pool pool_of="$c_id's accounts"
+    pool=$(printf '%s\n' "${c_principals[@]%%#*}")
     resolve_accounts "$@"
     bases=("${names[@]}")
   fi
@@ -1745,7 +1808,16 @@ offer_accounts() {
   offer ${targets[@]+"${targets[@]}"}
 }
 
-# Prints the names of the accounts set up from here.
+# Prints the names of the accounts set up from here, removed ones too.
+recorded_accounts() {
+  local f
+  for f in "$accounts"/*; do
+    [[ -f $f ]] && printf '%s\n' "${f##*/}"
+  done
+  return 0
+}
+
+# Prints the names of the accounts set up from here and not removed.
 open_accounts() {
   local f
   for f in "$accounts"/*; do
@@ -1767,14 +1839,15 @@ granted_accounts() {
 # Offers [USER@]HOST for the accounts named in lines $1: each ~/.ssh/config
 # alias that ssh -G resolves to one of them, with $cur's USER@ if it has one;
 # then, for each account no alias reaches, its HOST alone when that resolves
-# to it, else its name. Only words $cur begins are resolved.
+# to it, else its name. Only words $cur begins are resolved, and none of the
+# words in $2, separated by spaces, is offered.
 offer_named_accounts() {
   local h name user='' reached=' '
   local -a targets=()
   [[ -n $1 ]] || return 0
   [[ $cur != *@* ]] || user=${cur%%@*}@
   while IFS= read -r h; do
-    [[ $user$h == "$cur"* ]] || continue
+    [[ $user$h == "$cur"* && " ${2-} " != *" $user$h "* ]] || continue
     if name=$(account_name "$user$h") && [[ $'\n'$1$'\n' == *$'\n'$name$'\n'* ]]; then
       targets+=("$user$h")
       reached+="$name "
@@ -1783,7 +1856,7 @@ offer_named_accounts() {
   while IFS= read -r name; do
     [[ $reached != *" $name "* ]] || continue
     h=${name#*@}
-    if [[ -z $user && $h == "$cur"* && $(account_name "$h") == "$name" ]]; then
+    if [[ -z $user && $h == "$cur"* && " ${2-} " != *" $h "* && $(account_name "$h") == "$name" ]]; then
       targets+=("$h")
     else
       targets+=("$name")
@@ -1953,13 +2026,17 @@ cmd_complete() {
       ;;
   esac
   page=$cmd
+  # account lists the accounts its words name, unless the first is a verb.
   if is_noun "$cmd"; then
     if ((${#words[@]} == 0)); then
       offer_commands "$cmd"
+      [[ $cmd != account ]] || offer_named_accounts "$(recorded_accounts)" "$(verbs account | tr -d ,)"
       return 0
     fi
-    page="$cmd ${words[0]}"
-    words=("${words[@]:1}")
+    if [[ $cmd != account ]] || command_lines "$cmd" | cut -d'|' -f1 | grep -qxF -- "$cmd ${words[0]}"; then
+      page="$cmd ${words[0]}"
+      words=("${words[@]:1}")
+    fi
   fi
   table=$(page_options "$page")
   # The words before $cur as parse_options reads them: options anywhere
@@ -1999,6 +2076,7 @@ cmd_complete() {
         ;;
       grant:* | 'account reset:'*) offer_named_accounts "$(open_accounts)" ;;
       revoke:*) offer_named_accounts "$(granted_accounts "$first")" ;;
+      account:*) offer_named_accounts "$(recorded_accounts)" ;;
       'account add:'* | 'account rm:'*) offer_accounts ;;
     esac
   fi
