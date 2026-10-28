@@ -81,7 +81,7 @@ test_cli() {
   expect "account rm takes no -p" 2 'unknown option -p' "$lend_ssh" account rm -p dave@a
   expect "-k can't hold a quote" 2 "can't contain a single quote" "$lend_ssh" account add -k "it's" dave@a
   expect "... nor --file" 2 "can't contain a single quote" "$lend_ssh" account add --file="it's" dave@a
-  expect "unknown account command" 2 "unknown account command 'frob' \(add, reset, rm, or none to list\)" \
+  expect "unknown account command" 2 "'frob' is neither an account command \(add, reset, rm\) nor an account set up from here" \
     "$lend_ssh" account frob
   expect "revoke needs an agent" 2 'revoke takes an AGENT' "$lend_ssh" revoke
   expect "revoke takes no -k" 2 'unknown option -k' "$lend_ssh" revoke -k f claude dave@a
@@ -119,7 +119,7 @@ test_help() {
   expect "... but not after --" 2 "'-h' isn't \[USER@\]HOST" "$lend_ssh" account add -p -- -h
   expect "help COMMAND shows the same" 0 '^usage: lend-ssh agent add \[-f\] NAME KEY' "$lend_ssh" help agent add
   expect "a verb's -h" 0 '^usage: lend-ssh account rm ' "$lend_ssh" account rm -h
-  expect "a noun's -h has its usage" 0 '^usage: lend-ssh account$' "$lend_ssh" account -h
+  expect "a noun's -h has its usage" 0 '^usage: lend-ssh account \[\[USER@\]HOST\.\.\.\]$' "$lend_ssh" account -h
   expect "... what it does" 0 '^Lists the accounts set up from here' "$lend_ssh" account -h
   expect "... and its commands" 0 '^  rm \[-k FILE\]' "$lend_ssh" account -h
   expect "an unknown verb doesn't hide -h" 0 '^usage: lend-ssh agent$' "$lend_ssh" agent frob -h
@@ -364,6 +364,114 @@ test_grant_fg() {
   expect "... revoking what it granted" 0 '^f: dave@hosta \(revoked\) until ' cat "$work/fg.out"
   expect "... and leaving the rest" 0 'Principals: deploy@hostb Critical' \
     bash -c '"$1" agent show "$2" | tr -s " \n" " "' _ "$lend_ssh" "$work/f"
+}
+
+# The principals of certificate $1, sorted, on one line.
+principals_of() {
+  ssh-keygen -L -f "$1" | awk '/^ *Principals:/ { p = 1; next } /^ *Critical Options:/ { p = 0 } p { print $1 }' |
+    sort | paste -sd' ' -
+}
+
+# shellcheck disable=SC2016  # bash -c scripts take their own arguments
+test_patterns() {
+  make_ca
+  keygen "$work/p"
+  # ssh -G reads the home in /etc/passwd, not $HOME. Account alias is named
+  # dave@real, while ssh -G turns dave@real itself into dave@elsewhere. Your
+  # own user name is tester.
+  mkdir -p "$work/bin" "$HOME/.ssh"
+  printf 'Host alias\n  HostName real\nHost real\n  HostName elsewhere\nHost wild\n  HostName web*\nHost reset\n  HostName real\n  User dave\nHost *\n  User tester\n' >"$HOME/.ssh/config"
+  printf '#!/bin/sh\nexec %s -F %s "$@"\n' "$(command -v ssh)" "$HOME/.ssh/config" >"$work/bin/ssh"
+  chmod +x "$work/bin/ssh"
+  PATH=$work/bin:$PATH
+
+  expect "grant: a pattern with no accounts set up" 1 "'web\*' matches none of the accounts set up from here" \
+    "$lend_ssh" grant -t 1h "$work/p" 'web*'
+  expect "account: a pattern with no accounts set up" 1 "'web\*' matches none of the accounts set up from here" \
+    "$lend_ssh" account 'web*'
+  "$lend_ssh" account add -p dave@web1 deploy@web1 dave@web2 deploy@web3 dave@db1 dave@web9 dave@alias >/dev/null
+  echo "1 removed" >"$HOME/.config/lend-ssh/accounts/dave@web9"
+  echo 2 >"$HOME/.config/lend-ssh/accounts/dave@db1"
+
+  expect "account lists the accounts a pattern matches, removed ones too" 0 \
+    '^dave@web1 	no agent dave@web2 	no agent dave@web9 \(removed\) $' \
+    bash -c '"$1" account "dave@web*" | tr "\n" " "' _ "$lend_ssh"
+  expect "... a pattern without USER@ matching the host for any user" 0 \
+    '^dave@web1 	no agent deploy@web1 	no agent deploy@web3 	no agent $' \
+    bash -c '"$1" account "web[13]" | tr "\n" " "' _ "$lend_ssh"
+  expect "... an account as grant takes it, by its name" 0 '^dave@real 	no agent $' \
+    bash -c '"$1" account dave@alias | tr "\n" " "' _ "$lend_ssh"
+  expect "... each once, for several arguments" 0 '^dave@db1 dave@web1 deploy@web1 $' \
+    bash -c '"$1" account "*@web1" "dave@[dw]*1" dave@web1 | grep -v "^	" | tr "\n" " "' _ "$lend_ssh"
+  expect "account: a pattern that matches none, alongside one that does" 1 "'mail\*' matches none of the accounts set up from here" \
+    "$lend_ssh" account dave@web1 'mail*'
+  expect "account: an account not set up" 1 "'dave@mail' isn't an account set up from here" \
+    "$lend_ssh" account dave@mail
+  expect "account: an alias whose HostName holds * is no pattern" 1 "'wild' is 'tester@web\\*', which can't be a name" \
+    "$lend_ssh" account wild
+  expect "account: a host not set up for you" 2 "'web1' is neither an account command \(add, reset, rm\) nor an account set up from here" \
+    "$lend_ssh" account web1
+
+  expect "grant takes a pattern for the accounts set up and not removed" 0 \
+    '^p: dave@web1 \(new\) until [0-9-]+ [0-9:]+ p: dave@web2 \(new\) until [0-9-]+ [0-9:]+ $' \
+    bash -c '"$1" grant -t 1h -I p "$2" "dave@web*" | tr "\n" " "' _ "$lend_ssh" "$work/p"
+  check "... as their principals" test "$(principals_of "$work/p-cert.pub")" = "dave@web1 dave@web2"
+  keygen "$work/q"
+  "$lend_ssh" grant -t 1h -I q "$work/q" 'web[1]' 'db*' >/dev/null
+  check "a pattern without USER@ matches the host for any user, and a numbered account" \
+    test "$(principals_of "$work/q-cert.pub")" = "dave@db1#2 dave@web1 deploy@web1"
+  keygen "$work/r"
+  "$lend_ssh" grant -t 1h -I r "$work/r" '*@web1' 'dave@*' dave@web1 >/dev/null
+  check "grant gives each account once, however many arguments match it" \
+    test "$(principals_of "$work/r-cert.pub")" = "dave@db1#2 dave@real dave@web1 dave@web2 deploy@web1"
+  cp "$work/r-cert.pub" "$work/r-cert.before"
+  expect "grant: a pattern that matches none, alongside one that does" 1 "'mail\*' matches none of the accounts set up from here" \
+    "$lend_ssh" grant -t 2h -I r "$work/r" deploy@web3 'mail*'
+  check "... grants nothing" cmp -s "$work/r-cert.pub" "$work/r-cert.before"
+  echo 1 >"$HOME/.config/lend-ssh/accounts/dave@2001:db8::1"
+  keygen "$work/v"
+  "$lend_ssh" grant -t 1h -I v "$work/v" 'dave@2001:*' 'dave@web1' >/dev/null
+  check "a pattern matches an IPv6 account" test "$(principals_of "$work/v-cert.pub")" = "dave@2001:db8::1 dave@web1"
+  rm "$HOME/.config/lend-ssh/accounts/dave@2001:db8::1"
+  expect "grant matches a pattern against the name, not ssh -G of it" 0 '^r: dave@real \(new\)' \
+    "$lend_ssh" grant -t 1h -I r "$work/r" 'dave@rea?'
+
+  expect "revoke takes a pattern without USER@ for the agent's accounts, any user" 0 \
+    '^r: dave@web1 \(revoked\) until [0-9-]+ [0-9:]+ r: deploy@web1 \(revoked\) until ' \
+    bash -c '"$1" revoke "$2" "web[1]" | tr "\n" " "' _ "$lend_ssh" "$work/r"
+  check "... leaving the rest" test "$(principals_of "$work/r-cert.pub")" = "dave@db1#2 dave@real dave@web2"
+  cp "$work/r-cert.pub" "$work/r-cert.before"
+  expect "revoke: a pattern that matches none of them" 1 "'deploy@\*' matches none of r's accounts" \
+    "$lend_ssh" revoke "$work/r" 'dave@*' 'deploy@*'
+  check "... revokes nothing" cmp -s "$work/r-cert.pub" "$work/r-cert.before"
+  expect "revoke: overlapping patterns" 0 '^r: dave@real \(revoked\) until .* r: dave@db1 \(revoked\) until .* r: dave@web2 \(revoked\) until ' \
+    bash -c '"$1" revoke "$2" "dave@*" "*2" "db1" | tr "\n" " "' _ "$lend_ssh" "$work/r"
+  check "... removes the certificate" test ! -e "$work/r-cert.pub"
+  expect "revoke: a pattern with no grant to match" 1 "'dave@\*' matches none of $work/r's accounts" \
+    "$lend_ssh" revoke "$work/r" 'dave@*'
+  expect "... while an account with no grant is no error" 0 ': no grant to revoke$' \
+    "$lend_ssh" revoke "$work/r" dave@web1
+  completes 'reset' account res
+  completes 'add reset rm dave@db1 dave@real dave@web1 dave@web2 dave@web9 deploy@web1 deploy@web3' account ''
+  expect "account add takes no pattern" 1 "'dave@web\*' is .*which can't be a name" \
+    "$lend_ssh" account add -p 'dave@web*'
+
+  # grant -F: Ctrl+C takes back the accounts the pattern matched, by name,
+  # and not dave@rest, which matches it but was granted later.
+  keygen "$work/f"
+  perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV' "$lend_ssh" grant -F -t 1h -I f "$work/f" 'dave@re*' >"$work/fg.out" 2>&1 &
+  local pid=$! i status=0
+  for ((i = 0; i < 50; i++)); do
+    grep -q '^Holding until' "$work/fg.out" && break
+    sleep 0.1
+  done
+  "$lend_ssh" account add -p dave@rest >/dev/null
+  "$lend_ssh" grant -t 1h -I f "$work/f" dave@rest >/dev/null
+  kill -INT "$pid"
+  wait "$pid" || status=$?
+  check "Ctrl+C on grant -F with a pattern exits 130" test "$status" = 130
+  expect "... revoking the account it matched then" 0 '^f: dave@real \(revoked\) until ' cat "$work/fg.out"
+  check "... and only that one" test "$(principals_of "$work/f-cert.pub")" = "dave@rest"
 }
 
 # shellcheck disable=SC2016  # bash -c scripts take their own arguments
@@ -1168,7 +1276,9 @@ test_completion() {
   completes 'add show rm' help agent ''
   completes '' help grant ''
   completes '' help agent show ''
-  completes 'add reset rm' account ''
+  completes 'add reset rm box build gw ann@gw ann@myhost' account ''
+  completes 'ann@myhost' account ann@m
+  completes 'build gw ann@gw ann@myhost' account box ''
   completes '-k --file' account reset -
   completes 'box build' account reset b
   completes 'box build' account reset -k f b
@@ -1195,7 +1305,7 @@ test_completion() {
   completes 'codex' -t 4h grant co
   completes 'codex' -I me grant -t 4h co
   completes '-t --time -O --option -I --id -D --no-deadline -F --fg' -t 4h grant -
-  completes 'add reset rm' -k x account ''
+  completes 'add reset rm box build gw ann@gw ann@myhost' -k x account ''
   completes '-p --print -k --file' -k x account add -
   completes '-k --file' -p account add -
   completes "$commands" -h ''
@@ -1725,6 +1835,7 @@ run test_help
 run test_init
 run test_grant
 run test_grant_fg
+run test_patterns
 run test_revoke
 run test_forged
 run test_ssh_agent

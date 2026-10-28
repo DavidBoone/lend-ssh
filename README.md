@@ -183,6 +183,26 @@ claude: dave@myhost (kept) until 2026-10-04 18:41:07
 
 To change `-O` or `-D` on a valid certificate, `revoke` the agent first.
 
+An account holding `*`, `?` or `[` is a pattern for every account set up from
+here that it matches, as in ssh's config: `'deploy@web*'` matches each `web`
+host for `deploy`, and `'web*'` for any user. Quote it, so that the shell
+passes it on. A pattern that matches no account fails the command, which then
+grants nothing. `lend-ssh account PATTERN` lists the accounts it matches, so
+you can check before granting:
+
+```
+$ lend-ssh account 'deploy@web*'
+deploy@web1
+        no agent
+deploy@web2
+        no agent
+$ lend-ssh grant -t 4h claude 'deploy@web*'
+claude: deploy@web1 (new) until 2026-10-04 18:41:07
+claude: deploy@web2 (new) until 2026-10-04 18:41:07
+```
+
+`revoke` takes a pattern too, matched against the agent's accounts.
+
 With `-F` (`--fg`), `grant` stays in the foreground until the certificate
 expires and says so. Pressing Ctrl+C before then revokes the accounts it
 granted, as `revoke` does.
@@ -430,7 +450,7 @@ Day to day:
       take these accounts back from AGENT
   agent
       list the agents, and what they can reach until when
-  account
+  account [[USER@]HOST...]
       list the accounts, and which agents can reach them until when
   agent show AGENT
       show AGENT's certificate in detail
