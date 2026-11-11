@@ -38,6 +38,12 @@ however many arguments match it, and a pattern that matches none fails the
 command. `grant -F` revokes, on Ctrl+C, the accounts its arguments named
 when it started.
 
+A `-` argument stands for the words on stdin, each an account or pattern as
+if given in its place, with `#` to the end of a line dropped. It may appear
+once, and stdin must name at least one account. `grant` offers to set up an
+account only when stdin is a terminal, so with accounts from a file or a pipe
+it fails instead, naming the `account add` to run.
+
 ### Account numbers
 
 Each account set up from here has a number, kept in
