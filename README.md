@@ -203,6 +203,23 @@ claude: deploy@web2 (new) until 2026-10-04 18:41:07
 
 `revoke` takes a pattern too, matched against the agent's accounts.
 
+A `-` among the accounts reads more from stdin, so a list of them can live in
+a file, separated by spaces or lines, with `#` starting a comment. Patterns
+there need no quotes. Every command that takes accounts takes `-`:
+
+```
+$ cat debian-hosts.txt
+# the Debian boxes
+deploy@web1
+deploy@web2
+dave@db1
+$ lend-ssh grant -t 5m claude - < debian-hosts.txt
+$ some-inventory-command | lend-ssh revoke claude -
+```
+
+`grant` can't read both its accounts and, as `-` for AGENT, a public key from
+stdin.
+
 With `-F` (`--fg`), `grant` stays in the foreground until the certificate
 expires and says so. Pressing Ctrl+C before then revokes the accounts it
 granted, as `revoke` does.
@@ -432,7 +449,8 @@ usage: lend-ssh COMMAND [ARGS]
 
 Gives AI agents, or anything else you'd rather not hand your own SSH key,
 SSH access to your accounts that ends on its own. An account is [USER@]HOST
-as ssh takes it, your own user name there unless you give USER.
+as ssh takes it, your own user name there unless you give USER. A - in
+place of accounts reads them from stdin, separated by spaces or lines.
 
 Set up, once:
   init

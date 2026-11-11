@@ -86,7 +86,9 @@ EOF2
 Logs in to each account over ssh, as you normally do, and adds a line to its
 ~/.ssh/authorized_keys so that it accepts the certificates grant makes for it.
 An account is [USER@]HOST as ssh takes it; without USER@, it's your own user
-name there, or the User your ssh config sets.
+name there, or the User your ssh config sets. A - in place of accounts reads
+them from stdin, separated by spaces or lines, with # starting a comment, as
+every command that takes accounts does.
 
 With -p, it prints the lines for you to add yourself, and from then on treats
 the accounts as set up.
@@ -199,11 +201,11 @@ accounts it has, and the later of the two expiry times. To change -O or -D,
 revoke AGENT first.
 
 AGENT is an agent's name, or else a public key file, a public key, or - to
-read one from stdin. For a public key, grant prints the certificate instead
-of writing it, and logs it under the key's comment; it keeps no copy, so
-granting again replaces the certificate. -O takes permit-port-forwarding,
-permit-agent-forwarding, permit-X11-forwarding, permit-user-rc, or any
-ssh-keygen -O option.
+read one from stdin, unless a - among the accounts reads them from there.
+For a public key, grant prints the certificate instead of writing it, and
+logs it under the key's comment; it keeps no copy, so granting again replaces
+the certificate. -O takes permit-port-forwarding, permit-agent-forwarding,
+permit-X11-forwarding, permit-user-rc, or any ssh-keygen -O option.
 
 With -F, grant stays in the foreground until the certificate expires and then
 says so. If you press Ctrl+C before, it revokes the accounts it granted, as
@@ -416,7 +418,8 @@ usage() {
   echo
   echo "Gives AI agents, or anything else you'd rather not hand your own SSH key,"
   echo "SSH access to your accounts that ends on its own. An account is [USER@]HOST"
-  echo "as ssh takes it, your own user name there unless you give USER."
+  echo "as ssh takes it, your own user name there unless you give USER. A - in"
+  echo "place of accounts reads them from stdin, separated by spaces or lines."
   while IFS='|' read -r name args desc; do
     if [[ -z $desc ]]; then
       printf '\n%s:\n' "$name"
@@ -520,19 +523,48 @@ account_matches() {
   if [[ $1 == *@* ]]; then [[ $2 == $1 ]]; else [[ ${2#*@} == $1 ]]; fi
 }
 
+# Sets accounts_in to the [USER@]HOST arguments $@, with a - replaced by the
+# accounts on stdin: words separated by spaces or lines, where # starts a
+# comment.
+expand_accounts() {
+  local t w line stdin=''
+  local -a words
+  accounts_in=()
+  for t in "$@"; do
+    if [[ $t != - ]]; then
+      [[ $t != -* ]] || usage_error "'$t' isn't [USER@]HOST"
+      accounts_in+=("$t")
+      continue
+    fi
+    [[ -z $stdin ]] || usage_error "'-' reads the accounts on stdin, so give it once"
+    stdin=0
+    while IFS= read -r line || [[ -n $line ]]; do
+      line=${line%$'\r'}
+      read -ra words <<<"${line%%#*}" || true
+      for w in ${words[@]+"${words[@]}"}; do
+        [[ $w != -* ]] || usage_error "'$w' on stdin isn't [USER@]HOST"
+        accounts_in+=("$w")
+        stdin=$((stdin + 1))
+      done
+    done
+    [[ $stdin -gt 0 ]] || die "no accounts on stdin"
+  done
+}
+
 # Sets dests to the accounts [USER@]HOST as given, and names to their
 # USER@HOST names: the user and host name ssh -G gives for each, or with
 # $names_given set, the name as given; once each. A [USER@]HOST holding *, ?
 # or [ is a pattern, which stands for the accounts among those named in lines
 # $pool it matches, as their names. $pool_of says where they are from; unset,
-# there are no patterns.
+# there are no patterns. A - stands for the accounts on stdin, as
+# expand_accounts reads them.
 resolve_accounts() {
   local t name found pat
-  local -a found_names
+  local -a found_names accounts_in
   [[ $# -gt 0 ]] || usage_error "name at least one [USER@]HOST"
+  expand_accounts "$@"
   dests=() names=()
-  for t in "$@"; do
-    [[ $t != -* ]] || usage_error "'$t' isn't [USER@]HOST"
+  for t in "${accounts_in[@]}"; do
     found_names=() pat=''
     [[ -z ${pool_of-} ]] || ! is_pattern "$t" || pat=1
     if [[ -n $pat ]]; then
@@ -1263,6 +1295,9 @@ cmd_grant() {
   if [[ -n $fg && ( $key == - || ( ! -e $key && ! -e $key.pub ) ) ]]; then
     usage_error "-F needs an agent whose certificate is kept here, not a public key or -"
   fi
+  if [[ $key == - && " $* " == *" - "* ]]; then
+    usage_error "AGENT - and accounts - both read stdin; name the accounts, or give the key as a file"
+  fi
   local pool pool_of='the accounts set up from here'
   pool=$(open_accounts)
   resolve_accounts "$@"
@@ -1393,6 +1428,11 @@ cmd_revoke() {
   local snap
   private_dir snap
   cp "$(pubkey_of "$key")" "$snap/key.pub"
+  if [[ $# -gt 1 ]]; then
+    local -a accounts_in
+    expand_accounts "${@:2}"
+    set -- "$1" "${accounts_in[@]}"
+  fi
   if ! cert_info "$cert" "$snap/key.pub" || ! cert_valid; then
     for p in "${@:2}"; do
       ! is_pattern "$p" || die "'$p' matches none of $1's accounts"

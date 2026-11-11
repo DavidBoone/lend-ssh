@@ -63,10 +63,15 @@ def wait_for(marker, timeout=30):
     return head
 
 
-def settle(quiet=0.5, timeout=10):
-    """Reads until the shell has printed nothing for quiet seconds."""
+def settle(start=b"", quiet=0.5, timeout=10):
+    """Reads until the output holds start, then until the shell has printed
+    nothing for quiet seconds."""
     global out
     end = time.time() + timeout
+    while start not in out and time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            out += os.read(fd, 65536)
     last = time.time()
     while time.time() - last < quiet and time.time() < end:
         r, _, _ = select.select([fd], [], [], 0.05)
@@ -105,7 +110,8 @@ wait_for(prompt.encode())
 for line in lines:
     if listing:
         os.write(fd, line.encode() + (b"\t\t" if shell == "bash" else b"\t"))
-        settle()
+        # the list starts on a line of its own, however long completing takes
+        settle(b"\n")
         shown, out = out, b""
         os.write(fd, b"\x03")
         wait_for(prompt.encode())

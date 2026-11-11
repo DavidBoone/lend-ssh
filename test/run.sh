@@ -475,6 +475,65 @@ test_patterns() {
 }
 
 # shellcheck disable=SC2016  # bash -c scripts take their own arguments
+test_accounts_stdin() {
+  make_ca
+  keygen "$work/s"
+  expect "account add -p - reads accounts from stdin: spaces, lines, comments, no final newline" 0 '' \
+    bash -c 'printf "# hosts\n\ndave@web1 dave@web2  # two\n\tdeploy@web1\ndave@db1" | "$1" account add -p -' _ "$lend_ssh"
+  expect "... setting up each" 0 '^dave@db1 dave@web1 dave@web2 deploy@web1 $' \
+    bash -c '"$1" account | grep -v "^[[:space:]]" | tr "\n" " "' _ "$lend_ssh"
+  expect "grant takes - alongside named accounts, and patterns on stdin" 0 \
+    '^s: dave@db1 \(new\) until .* s: dave@web1 \(new\) until .* s: dave@web2 \(new\) until ' \
+    bash -c 'echo "dave@web*" | "$1" grant -t 1h -I s "$2" dave@db1 - | tr "\n" " "' _ "$lend_ssh" "$work/s"
+  check "... as principals" test "$(principals_of "$work/s-cert.pub")" = "dave@db1 dave@web1 dave@web2"
+  expect "revoke takes accounts from stdin" 0 '^s: dave@web2 \(revoked\) until ' \
+    bash -c 'echo dave@web2 | "$1" revoke "$2" -' _ "$lend_ssh" "$work/s"
+  check "... leaving the rest" test "$(principals_of "$work/s-cert.pub")" = "dave@db1 dave@web1"
+  cp "$work/s-cert.pub" "$work/s-cert.before"
+  expect "revoke: stdin with only comments names no account" 1 'no accounts on stdin' \
+    bash -c 'printf "# none\n\n" | "$1" revoke "$2" -' _ "$lend_ssh" "$work/s"
+  check "... and revokes nothing" cmp -s "$work/s-cert.pub" "$work/s-cert.before"
+  expect "account: stdin with only comments fails, though other accounts are named" 1 'no accounts on stdin' \
+    bash -c 'echo "#" | "$1" account dave@web1 -' _ "$lend_ssh"
+  expect "account lists the accounts on stdin, CRLF line ends and patterns too" 0 '^dave@db1 deploy@web1 $' \
+    bash -c 'printf "dave@db1\r\n\r\ndeploy@*\r\n" | "$1" account - | grep -v "^[[:space:]]" | tr "\n" " "' _ "$lend_ssh"
+  keygen "$work/n"
+  expect "revoke with no grant: a pattern on stdin that matches none" 1 "'web\*' matches none of $work/n's accounts" \
+    bash -c 'echo "web*" | "$1" revoke "$2" -' _ "$lend_ssh" "$work/n"
+  expect "revoke with no grant: stdin with no accounts" 1 'no accounts on stdin' \
+    bash -c '"$1" revoke "$2" - </dev/null' _ "$lend_ssh" "$work/n"
+  expect "revoke with no grant: a - on stdin" 2 "'-' on stdin isn't \[USER@\]HOST" \
+    bash -c 'echo "- dave@web1" | "$1" revoke "$2" -' _ "$lend_ssh" "$work/n"
+  expect "revoke with a grant: a - on stdin" 2 "'-' on stdin isn't \[USER@\]HOST" \
+    bash -c 'echo "- dave@web1" | "$1" revoke "$2" -' _ "$lend_ssh" "$work/s"
+  expect "account: - given twice" 2 "'-' reads the accounts on stdin, so give it once" \
+    bash -c 'echo dave@web1 | "$1" account - -' _ "$lend_ssh"
+  expect "grant: AGENT - and accounts -" 2 'AGENT - and accounts - both read stdin' \
+    bash -c '"$1" grant -t 1h - - <"$2.pub"' _ "$lend_ssh" "$work/s"
+  expect "grant: an account on stdin not set up fails, naming account add" 1 \
+    "dave@mail1 isn't set up for agents from here: '.*account add dave@mail1' sets it up" \
+    bash -c 'echo dave@mail1 | "$1" grant -t 1h "$2" -' _ "$lend_ssh" "$work/s"
+  expect "grant -h tells of accounts -" 0 'unless a - among the accounts reads them from there' "$lend_ssh" grant -h
+  expect "account add -h tells of accounts -" 0 'A - in place of accounts reads' "$lend_ssh" account add -h
+
+  # grant -F with accounts on stdin: Ctrl+C takes back the accounts it read.
+  keygen "$work/f"
+  echo "dave@web*" >"$work/f.accounts"
+  perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV' "$lend_ssh" grant -F -t 1h -I f "$work/f" dave@db1 - \
+    <"$work/f.accounts" >"$work/fg.out" 2>&1 &
+  local pid=$! i status=0
+  for ((i = 0; i < 50; i++)); do
+    grep -q '^Holding until' "$work/fg.out" && break
+    sleep 0.1
+  done
+  "$lend_ssh" grant -t 1h -I f "$work/f" deploy@web1 >/dev/null
+  kill -INT "$pid"
+  wait "$pid" || status=$?
+  check "Ctrl+C on grant -F with accounts on stdin exits 130" test "$status" = 130
+  check "... revoking the accounts it read, and only those" test "$(principals_of "$work/f-cert.pub")" = "deploy@web1"
+}
+
+# shellcheck disable=SC2016  # bash -c scripts take their own arguments
 test_revoke() {
   make_ca
   keygen "$work/r"
@@ -1836,6 +1895,7 @@ run test_init
 run test_grant
 run test_grant_fg
 run test_patterns
+run test_accounts_stdin
 run test_revoke
 run test_forged
 run test_ssh_agent
